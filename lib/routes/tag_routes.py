@@ -12,10 +12,12 @@
 import System
 from pyrevit import routes, script, DB
 from System.Collections.Generic import List
+from Autodesk.Revit.Exceptions import RegenerationFailedException
 
 from routes.json_safety import sanitize_for_json
 from routes.revit_compat import get_element_id_value as eid_int
 from routes.revit_compat import make_element_id
+from routes.revit_compat import TEXT_TYPES
 
 
 # Kategorie -> Tag-Kategorie-Mapping (Host-Kat -> zugehoerige Tag-Kat)
@@ -77,6 +79,8 @@ def _get_element_center_xyz(element):
             curve = location.Curve
             try:
                 return curve.Evaluate(0.5, True)
+            except RegenerationFailedException:
+                raise
             except Exception:
                 pass
 
@@ -89,6 +93,8 @@ def _get_element_center_xyz(element):
                 (bbox.Min.Y + bbox.Max.Y) / 2.0,
                 (bbox.Min.Z + bbox.Max.Z) / 2.0,
             )
+    except RegenerationFailedException:
+        raise
     except Exception:
         pass
     return DB.XYZ(0.0, 0.0, 0.0)
@@ -97,30 +103,23 @@ def _get_element_center_xyz(element):
 def _existing_tagged_element_ids(doc, view_id):
     """Return the set of element IDs that already carry an IndependentTag in the view."""
     tagged = set()
-    try:
-        tag_collector = DB.FilteredElementCollector(doc, view_id).OfClass(DB.IndependentTag)
-        for tag in tag_collector:
-            try:
-                # Revit 2022+: GetTaggedLocalElementIds returns ICollection<ElementId>
-                if hasattr(tag, 'GetTaggedLocalElementIds'):
-                    for tid in tag.GetTaggedLocalElementIds():
-                        tagged.add(eid_int(tid))
-                elif hasattr(tag, 'TaggedLocalElementId'):
-                    tagged.add(eid_int(tag.TaggedLocalElementId))
-            except Exception:
-                continue
-    except Exception:
-        pass
-    # Plus RoomTags
-    try:
-        rt_collector = DB.FilteredElementCollector(doc, view_id).OfClass(DB.Architecture.RoomTag)
-        for rt in rt_collector:
-            try:
-                tagged.add(eid_int(rt.TaggedLocalRoomId))
-            except Exception:
-                continue
-    except Exception:
-        pass
+    tag_collector = DB.FilteredElementCollector(doc, view_id).OfClass(DB.IndependentTag)
+    for tag in tag_collector:
+        # Revit 2022+: GetTaggedLocalElementIds returns ICollection<ElementId>
+        if hasattr(tag, 'GetTaggedLocalElementIds'):
+            for tid in tag.GetTaggedLocalElementIds():
+                tagged.add(eid_int(tid))
+        elif hasattr(tag, 'TaggedLocalElementId'):
+            tagged.add(eid_int(tag.TaggedLocalElementId))
+        else:
+            raise RuntimeError("Cannot determine the elements referenced by an existing tag")
+    # RoomTag is not supported by ElementClassFilter; use its built-in category.
+    rt_collector = (DB.FilteredElementCollector(doc, view_id)
+                    .OfCategory(DB.BuiltInCategory.OST_RoomTags)
+                    .WhereElementIsNotElementType())
+    for rt in rt_collector:
+        tagged.add(eid_int(rt.TaggedLocalRoomId))
+    # Enumeration errors must propagate before any new tags are created.
     return tagged
 
 
@@ -128,6 +127,7 @@ def _resolve_element_ids(doc, raw_ids):
     """Convert a list of stringified ints into a list of (element, ElementId) tuples + invalid list."""
     valid = []
     invalid = []
+    seen = set()
     if not raw_ids:
         return valid, invalid
     for raw in raw_ids:
@@ -143,7 +143,10 @@ def _resolve_element_ids(doc, raw_ids):
         if element is None:
             invalid.append(str(raw))
             continue
-        valid.append((element, eid))
+        element_id = eid_int(element.Id)
+        if element_id not in seen:
+            seen.add(element_id)
+            valid.append((element, eid))
     return valid, invalid
 
 
@@ -152,11 +155,13 @@ def _create_independent_tag(doc, view, element, tag_symbol_id, head_point, add_l
     try:
         # Reference to the element
         reference = DB.Reference(element)
+    except RegenerationFailedException:
+        raise
     except Exception as ref_error:
         return None, "Could not create reference: {}".format(ref_error)
 
     try:
-        # Revit 2018+ signature with explicit tag type
+        # Revit 2019+ signature with explicit tag type
         tag = DB.IndependentTag.Create(
             doc,
             tag_symbol_id,
@@ -167,6 +172,8 @@ def _create_independent_tag(doc, view, element, tag_symbol_id, head_point, add_l
             head_point,
         )
         return tag, None
+    except RegenerationFailedException:
+        raise
     except Exception as create_error:
         # Fallback: older signature without explicit tag type
         try:
@@ -180,6 +187,8 @@ def _create_independent_tag(doc, view, element, tag_symbol_id, head_point, add_l
                 head_point,
             )
             return tag, None
+        except RegenerationFailedException:
+            raise
         except Exception as fallback_error:
             return None, "Tag creation failed: {} / fallback: {}".format(create_error, fallback_error)
 
@@ -196,15 +205,21 @@ def _create_room_tag(doc, view, room, tag_symbol_id=None):
         link_room_id = DB.LinkElementId(room.Id)
 
         room_tag = doc.Create.NewRoomTag(link_room_id, uv_point, view.Id)
+        if room_tag is None:
+            return None, "RoomTag creation returned no tag"
 
         # If a specific tag-type was requested, swap it
         if tag_symbol_id is not None:
             try:
                 room_tag.RoomTagType = doc.GetElement(tag_symbol_id)
+            except RegenerationFailedException:
+                raise
             except Exception:
                 pass
 
         return room_tag, None
+    except RegenerationFailedException:
+        raise
     except Exception as room_error:
         return None, "RoomTag creation failed: {}".format(room_error)
 
@@ -213,12 +228,29 @@ def _ensure_tag_symbol_active(doc, symbol):
     """Tag family symbols must be Active before placement. Activate if needed."""
     if symbol is None:
         return
-    try:
-        if hasattr(symbol, 'IsActive') and not symbol.IsActive:
-            symbol.Activate()
-            doc.Regenerate()
-    except Exception:
-        pass
+    if hasattr(symbol, 'IsActive') and not symbol.IsActive:
+        symbol.Activate()
+        doc.Regenerate()
+
+
+def _operation_status(applied, failed):
+    if not failed:
+        return "success"
+    return "partial_success" if applied else "error"
+
+
+def _commit_transaction(transaction):
+    """Return an error response unless Revit confirms that changes were committed."""
+    status = transaction.Commit()
+    if status == DB.TransactionStatus.Committed:
+        return None
+    return routes.Response(status=409, data=sanitize_for_json({
+        "status": "error",
+        "error": "Tag transaction was not committed: {}".format(status),
+        "transaction_status": str(status),
+        "applied_count": 0,
+        "applied": [],
+    }))
 
 
 def register_routes(api):
@@ -245,7 +277,10 @@ def register_routes(api):
             if getattr(active_view, "IsTemplate", False):
                 return routes.Response(status=400, data={"status": "error", "error": "Active view is a template"})
 
-            valid, invalid = _resolve_element_ids(doc, payload.get('element_ids'))
+            element_ids = payload.get('element_ids')
+            if not isinstance(element_ids, list) or not element_ids:
+                return routes.Response(status=400, data={"status": "error", "error": "element_ids list required"})
+            valid, invalid = _resolve_element_ids(doc, element_ids)
             if not valid:
                 return routes.Response(status=400, data=sanitize_for_json({
                     "status": "error",
@@ -258,7 +293,7 @@ def register_routes(api):
             refresh_view = True if refresh_view is None else bool(refresh_view)
 
             applied = []
-            failed = []
+            failed = [{"element_id": raw, "error": "Invalid or missing element"} for raw in invalid]
             symbol_cache = {}
 
             transaction = DB.Transaction(doc, "Tag Elements By ID")
@@ -270,14 +305,9 @@ def register_routes(api):
                         if category is None:
                             failed.append({"element_id": str(eid_int(eid)), "error": "Element has no category"})
                             continue
-                        category_name = None
-                        try:
-                            category_name = DB.Category.GetCategory(doc, category.Id).Name if False else None
-                        except Exception:
-                            category_name = None
                         # Resolve OST_* name from BuiltInCategory enum value of the category
                         try:
-                            built_in = System.Enum.ToObject(DB.BuiltInCategory, category.Id.IntegerValue if hasattr(category.Id, 'IntegerValue') else eid_int(category.Id))
+                            built_in = System.Enum.ToObject(DB.BuiltInCategory, eid_int(category.Id))
                             host_cat_name = str(built_in)
                         except Exception:
                             host_cat_name = None
@@ -320,10 +350,14 @@ def register_routes(api):
                                 "tag_id": str(eid_int(tag.Id)),
                                 "category": host_cat_name,
                             })
+                    except RegenerationFailedException:
+                        raise
                     except Exception as item_error:
                         failed.append({"element_id": str(eid_int(eid)), "error": str(item_error)})
 
-                transaction.Commit()
+                commit_error = _commit_transaction(transaction)
+                if commit_error is not None:
+                    return commit_error
             except Exception:
                 try: transaction.RollBack()
                 except Exception: pass
@@ -334,7 +368,7 @@ def register_routes(api):
                 except Exception: pass
 
             return sanitize_for_json({
-                "status": "success" if not failed else "partial_success",
+                "status": _operation_status(applied, failed),
                 "message": "Tagged {} of {} elements in view '{}'.".format(
                     len(applied), len(valid), active_view.Name,
                 ),
@@ -367,6 +401,13 @@ def register_routes(api):
             categories = payload.get('category_names') or []
             if not categories or not isinstance(categories, list):
                 return routes.Response(status=400, data={"status": "error", "error": "category_names list required"})
+            if any(not isinstance(name, TEXT_TYPES) for name in categories):
+                return routes.Response(status=400, data={"status": "error", "error": "category_names must contain strings"})
+            unique_categories = []
+            for name in categories:
+                if name not in unique_categories:
+                    unique_categories.append(name)
+            categories = unique_categories
 
             active_view = uidoc.ActiveView if uidoc else None
             if active_view is None:
@@ -392,6 +433,7 @@ def register_routes(api):
                     built_in = _get_built_in_category(cat_name)
                     if built_in is None:
                         per_category[cat_name] = {"error": "Unknown category"}
+                        failed_total.append({"category": cat_name, "error": "Unknown category"})
                         continue
 
                     # Special-case rooms
@@ -411,11 +453,13 @@ def register_routes(api):
 
                     if cat_name not in HOST_TO_TAG_CATEGORY:
                         per_category[cat_name] = {"error": "No tag mapping"}
+                        failed_total.append({"category": cat_name, "error": "No tag mapping"})
                         continue
 
                     symbol, sym_error = _find_default_tag_symbol(doc, cat_name)
                     if sym_error:
                         per_category[cat_name] = {"error": sym_error}
+                        failed_total.append({"category": cat_name, "error": sym_error})
                         continue
                     _ensure_tag_symbol_active(doc, symbol)
 
@@ -445,6 +489,9 @@ def register_routes(api):
                                     "category": cat_name,
                                 })
                                 cat_applied += 1
+                                already_tagged.add(eid_int(eid))
+                        except RegenerationFailedException:
+                            raise
                         except Exception as item_error:
                             failed_total.append({"element_id": str(eid_int(eid)), "category": cat_name, "error": str(item_error)})
                             cat_failed += 1
@@ -456,7 +503,9 @@ def register_routes(api):
                         "skipped_already_tagged": cat_skipped,
                     }
 
-                transaction.Commit()
+                commit_error = _commit_transaction(transaction)
+                if commit_error is not None:
+                    return commit_error
             except Exception:
                 try: transaction.RollBack()
                 except Exception: pass
@@ -467,7 +516,7 @@ def register_routes(api):
                 except Exception: pass
 
             return sanitize_for_json({
-                "status": "success" if not failed_total else "partial_success",
+                "status": _operation_status(applied_total, failed_total),
                 "message": "Tagged {} elements across {} categories in view '{}' (skipped {} already-tagged).".format(
                     len(applied_total), len(categories), active_view.Name, skipped_already_tagged,
                 ),
@@ -497,6 +546,13 @@ def register_routes(api):
             if not isinstance(payload, dict):
                 return routes.Response(status=400, data={"status": "error", "error": "Invalid JSON payload"})
 
+            all_in_view = payload.get('all_in_view', False)
+            if not isinstance(all_in_view, bool):
+                return routes.Response(status=400, data={"status": "error", "error": "all_in_view must be a boolean"})
+            room_ids = payload.get('room_ids') or []
+            if not all_in_view and (not isinstance(room_ids, list) or not room_ids):
+                return routes.Response(status=400, data={"status": "error", "error": "room_ids list required or set all_in_view=true"})
+
             active_view = uidoc.ActiveView if uidoc else None
             if active_view is None:
                 return routes.Response(status=503, data={"status": "error", "error": "No active Revit view"})
@@ -509,20 +565,21 @@ def register_routes(api):
             already_tagged = _existing_tagged_element_ids(doc, active_view.Id)
             applied = []
             failed = []
+            invalid = []
             skipped = 0
 
             rooms_to_tag = []
-            if payload.get('all_in_view'):
+            if all_in_view:
                 collector = (DB.FilteredElementCollector(doc, active_view.Id)
                              .OfCategory(DB.BuiltInCategory.OST_Rooms)
                              .WhereElementIsNotElementType())
                 for room in collector:
                     rooms_to_tag.append(room)
             else:
-                room_ids = payload.get('room_ids') or []
                 valid, invalid = _resolve_element_ids(doc, room_ids)
+                failed.extend({"element_id": raw, "error": "Invalid or missing room"} for raw in invalid)
                 for element, _eid in valid:
-                    if element.Category is not None and element.Category.Name and 'Room' in element.Category.Name:
+                    if element.Category is not None and eid_int(element.Category.Id) == int(DB.BuiltInCategory.OST_Rooms):
                         rooms_to_tag.append(element)
                     else:
                         failed.append({"element_id": str(eid_int(element.Id)), "error": "Not a Room"})
@@ -542,7 +599,10 @@ def register_routes(api):
                             "room_id": str(eid_int(room.Id)),
                             "tag_id": str(eid_int(room_tag.Id)),
                         })
-                transaction.Commit()
+                        already_tagged.add(eid_int(room.Id))
+                commit_error = _commit_transaction(transaction)
+                if commit_error is not None:
+                    return commit_error
             except Exception:
                 try: transaction.RollBack()
                 except Exception: pass
@@ -553,7 +613,7 @@ def register_routes(api):
                 except Exception: pass
 
             return sanitize_for_json({
-                "status": "success" if not failed else "partial_success",
+                "status": _operation_status(applied, failed),
                 "message": "Tagged {} of {} rooms in view '{}' (skipped {} already-tagged).".format(
                     len(applied), len(rooms_to_tag), active_view.Name, skipped,
                 ),
@@ -562,6 +622,7 @@ def register_routes(api):
                 "applied": applied,
                 "failed_count": len(failed),
                 "failed": failed,
+                "invalid_ids": invalid,
                 "skipped_already_tagged": skipped,
             })
         except Exception as global_error:
@@ -590,4 +651,5 @@ def _bulk_tag_rooms_in_view(doc, active_view, already_tagged):
                 "tag_id": str(eid_int(room_tag.Id)),
                 "category": "OST_Rooms",
             })
+            already_tagged.add(eid_int(room.Id))
     return applied, failed, skipped

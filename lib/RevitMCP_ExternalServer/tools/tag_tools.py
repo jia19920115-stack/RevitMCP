@@ -14,6 +14,8 @@ TAG_ROOMS_TOOL_NAME = "tag_rooms"
 
 
 def _resolve_requested_element_ids(services, element_ids=None, result_handle: str = None, category_name: str = None):
+    if element_ids is not None and not isinstance(element_ids, list):
+        return None, None, {"status": "error", "message": "Element IDs must be a list."}
     resolved_ids, record, error = services.result_store.resolve_element_ids(
         element_ids=element_ids,
         result_handle=result_handle,
@@ -83,6 +85,8 @@ def tag_all_in_view_handler(
 ) -> dict:
     if not category_names or not isinstance(category_names, list):
         return {"status": "error", "message": "category_names list required (e.g. ['OST_Doors','OST_Windows'])."}
+    if any(not isinstance(name, str) for name in category_names):
+        return {"status": "error", "message": "category_names must contain strings."}
 
     services.logger.info(
         "MCP Tool executed: %s with categories=%s leader=%s",
@@ -121,6 +125,8 @@ def tag_rooms_handler(
     refresh_view: bool = True,
     **_kwargs,
 ) -> dict:
+    if not isinstance(all_in_view, bool):
+        return {"status": "error", "message": "all_in_view must be a boolean."}
     payload = {"refresh_view": bool(refresh_view)}
 
     if all_in_view:
@@ -153,6 +159,7 @@ def tag_rooms_handler(
             "status", "message", "view",
             "applied_count", "applied",
             "failed_count", "failed",
+            "invalid_ids",
             "skipped_already_tagged",
         ],
     )
