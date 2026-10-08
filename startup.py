@@ -190,6 +190,23 @@ try:
 
         schedule_routes.register_routes(api)
         logger.info("Schedule routes registered successfully")
+
+        # Modeling (element creation) routes are loaded separately so that a
+        # problem here never takes down the existing read/edit routes.
+        try:
+            from routes import modeling_routes
+            modeling_routes.register_routes(api)
+            logger.info("Modeling routes registered successfully")
+        except Exception as modeling_error:
+            logger.error("Modeling routes failed to load: {}".format(modeling_error), exc_info=True)
+
+        # MEP routes (linked model reading, connectors, fittings, connected pipe runs).
+        try:
+            from routes import mep_routes
+            mep_routes.register_routes(api)
+            logger.info("MEP routes registered successfully ({})".format(mep_routes.MEP_ROUTES_VERSION))
+        except Exception as mep_error:
+            logger.error("MEP routes failed to load: {}".format(mep_error), exc_info=True)
         
     except ImportError as ie:
         import_error_message = str(ie)

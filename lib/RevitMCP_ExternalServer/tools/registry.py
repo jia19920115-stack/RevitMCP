@@ -171,6 +171,8 @@ def build_tool_registry() -> ToolRegistry:
     from .view_tools import build_view_tools
     from .planning_tools import build_planning_tools
     from .schedule_tools import build_schedule_tools
+    from .modeling_tools import build_modeling_tools
+    from .mep_tools import build_mep_tools
 
     definitions = []
     definitions.extend(build_context_tools())
@@ -180,5 +182,7 @@ def build_tool_registry() -> ToolRegistry:
     definitions.extend(build_schedule_tools())
     definitions.extend(build_element_tools())
     definitions.extend(build_element_operation_tools())
+    definitions.extend(build_modeling_tools())
+    definitions.extend(build_mep_tools())
     definitions.extend(build_planning_tools())
     return ToolRegistry(definitions)
