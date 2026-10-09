@@ -15,6 +15,35 @@ except NameError:
     STRING_TYPES = (str,)
 
 
+class _WarningCollector(DB.IFailuresPreprocessor):
+    """Dismisses Revit warnings (not errors) so no dialog blocks the route; records their text
+    so the response can report them."""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def PreprocessFailures(self, failures_accessor):
+        try:
+            for failure in failures_accessor.GetFailureMessages():
+                if failure.GetSeverity() == DB.FailureSeverity.Warning:
+                    try:
+                        self.sink.append(str(failure.GetDescriptionText()))
+                    except Exception:
+                        pass
+                    failures_accessor.DeleteWarning(failure)
+        except Exception:
+            pass
+        return DB.FailureProcessingResult.Continue
+
+
+def _quiet_transaction(doc, name, sink):
+    transaction = DB.Transaction(doc, name)
+    options = transaction.GetFailureHandlingOptions()
+    options.SetFailuresPreprocessor(_WarningCollector(sink))
+    transaction.SetFailureHandlingOptions(options)
+    return transaction
+
+
 def _coerce_bool(value, default=False):
     if value is None:
         return default
@@ -484,9 +513,10 @@ def register_routes(api):
             failed = []
             skipped = []
             unpinned_ids = []
+            revit_warnings = []
 
             if deletion_mode == "batch":
-                transaction = DB.Transaction(doc, "Delete Elements")
+                transaction = _quiet_transaction(doc, "Delete Elements", revit_warnings)
                 transaction.Start()
                 try:
                     if unpin_before_delete:
@@ -539,7 +569,7 @@ def register_routes(api):
                         })
                         continue
 
-                    transaction = DB.Transaction(doc, "Delete Element {}".format(element_id_text))
+                    transaction = _quiet_transaction(doc, "Delete Element {}".format(element_id_text), revit_warnings)
                     transaction.Start()
                     try:
                         element = doc.GetElement(element_id)
@@ -604,6 +634,7 @@ def register_routes(api):
                 "failed": failed,
                 "skipped": skipped,
                 "unpinned_ids": unpinned_ids,
+                "revit_warnings": revit_warnings,
                 "candidates": candidates,
                 "dry_run": False,
                 "confirm_delete": True,
