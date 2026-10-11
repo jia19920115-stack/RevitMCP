@@ -385,6 +385,30 @@ def _set_parameter_value(param, new_value):
         except Exception:
             return False, "Could not convert '{}' to integer".format(new_value)
 
+    if param.StorageType == DB.StorageType.ElementId:
+        # Accept an element id or, for level-type parameters, a Level name (e.g. "1FL").
+        try:
+            owner = param.Element
+            doc = owner.Document if owner is not None else None
+            text = str(new_value).strip()
+            target_id = None
+            try:
+                target_id = DB.ElementId(int(text))
+            except Exception:
+                target_id = None
+            if target_id is None and doc is not None:
+                for level in DB.FilteredElementCollector(doc).OfClass(DB.Level):
+                    if level.Name == text:
+                        target_id = level.Id
+                        break
+            if target_id is None:
+                return False, "Could not resolve '{}' to an element id or level name".format(new_value)
+            if param.Set(target_id):
+                return True, None
+            return False, "Revit rejected '{}' for this ElementId parameter".format(new_value)
+        except Exception as ex:
+            return False, "Could not set ElementId parameter: {}".format(ex)
+
     return False, "Unsupported parameter type: {}".format(param.StorageType)
 
 
