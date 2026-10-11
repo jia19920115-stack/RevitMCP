@@ -52,7 +52,7 @@ from routes.modeling_routes import (
     _drop_collinear,
 )
 
-MEP_ROUTES_VERSION = "2026-10-11-mep-v10"
+MEP_ROUTES_VERSION = "2026-10-11-mep-v11"
 # v9: a run may start directly on the outlet of these fittings: the first 45-deg elbow
 # sits on the fitting with no pipe between, and only this pair may overlap.
 DIRECT_START_FAMILY_KEYS = (u"單口彎頭",)
@@ -1091,7 +1091,15 @@ def _place_wye(doc, main, symbol, joint, branch_dir, label, branch_d_ft=None):
 
     ids = {}
     run_a, run_b, branch = _run_connector_pair(_piping_connectors(instance))
-    lean = run_a if _connector_dir(branch).DotProduct(_connector_dir(run_a)) > 0 else run_b
+    lean_dot = _connector_dir(branch).DotProduct(_connector_dir(run_a))
+    if abs(lean_dot) > 0.2:
+        lean = run_a if lean_dot > 0 else run_b
+    else:
+        # sanitary tee (順T): the branch is square to the run, so its direction says nothing.
+        # Its sweep enters nearer the upstream run end; pick the run end closer to the branch.
+        run_axis = run_b.Origin.Subtract(run_a.Origin)
+        middle = run_a.Origin.Add(run_b.Origin).Multiply(0.5)
+        lean = run_b if branch.Origin.Subtract(middle).DotProduct(run_axis) > 0 else run_a
     ids["lean"], ids["branch"] = lean.Id, branch.Id
 
     # 1) the leaning run end faces the side the branch comes from
