@@ -131,7 +131,9 @@ def build_mep_tools() -> list[ToolDefinition]:
                         "description": (
                             "Each item: {connect_to: {element_id, connector_id?}, family_name?, type_name?, "
                             "diameter_mm?, outlet_direction?: {x, y, z}, inlet_connector_id?}. Without connector_id "
-                            "the first unconnected piping connector is used."
+                            "the first unconnected piping connector is used. Copy mode: {copy_element_ids: [...], "
+                            "from_level_name, to_level_name, delta_mm?: {x, y, z}, relevel?} copies fixtures, pipes "
+                            "and fittings to another floor and sets their level without moving them."
                         ),
                     },
                     "family_name": {"type": "string", "description": "Fitting family. type_name may be omitted if it has one type."},

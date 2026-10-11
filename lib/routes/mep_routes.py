@@ -52,7 +52,7 @@ from routes.modeling_routes import (
     _drop_collinear,
 )
 
-MEP_ROUTES_VERSION = "2026-10-07-mep-v9e"
+MEP_ROUTES_VERSION = "2026-10-11-mep-v11"
 # v9: a run may start directly on the outlet of these fittings: the first 45-deg elbow
 # sits on the fitting with no pipe between, and only this pair may overlap.
 DIRECT_START_FAMILY_KEYS = (u"單口彎頭",)
@@ -524,6 +524,178 @@ def _set_fitting_size(instance, diameter_ft):
     return None
 
 
+def _reference_point(element):
+    """A point that follows the element: location point, else first connector, else bbox centre."""
+    try:
+        location = element.Location
+        if isinstance(location, DB.LocationPoint):
+            return location.Point
+    except Exception:
+        pass
+    connectors = _piping_connectors(element)
+    if connectors:
+        ordered = sorted(connectors, key=lambda c: c.Id)
+        return ordered[0].Origin
+    try:
+        box = element.get_BoundingBox(None)
+        if box is not None:
+            return box.Min.Add(box.Max).Multiply(0.5)
+    except Exception:
+        pass
+    return None
+
+
+def _is_fitting_like(element):
+    try:
+        bic = get_element_id_value(element.Category.Id)
+    except Exception:
+        return False
+    return bic in (int(DB.BuiltInCategory.OST_PipeFitting), int(DB.BuiltInCategory.OST_PipeAccessory))
+
+
+def _copy_elements(doc, item, label, index, is_dry_run):
+    """Copy elements by delta_mm and/or from one level to another (same XY, new floor).
+
+    item: {copy_element_ids: [...], from_level_name?, to_level_name?, delta_mm?: {x, y, z},
+           relevel?: bool (default true when to_level_name is given)}
+
+    Fixtures are copied on their own, re-levelled while unconnected (their offset is corrected
+    so they stay where the copy put them), then the pipes and fittings are copied and joined
+    back to the fixture copies. A pipe or fitting that would shift when its level is changed
+    aborts the whole item, so a connected network is never dragged.
+    """
+    raw_ids = item.get("copy_element_ids")
+    if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+        raise ValueError(u"{}: copy_element_ids must be a non-empty list.".format(label))
+    delta_spec = item.get("delta_mm") or {}
+    dx = _to_float(delta_spec.get("x"), "delta_mm.x") or 0.0
+    dy = _to_float(delta_spec.get("y"), "delta_mm.y") or 0.0
+    dz = _to_float(delta_spec.get("z"), "delta_mm.z") or 0.0
+    to_level = None
+    if _text(item.get("to_level_name")):
+        to_level = _find_level(doc, item.get("to_level_name"), "to_level_name")
+        from_level = _find_level(doc, item.get("from_level_name"), "from_level_name")
+        dz += (to_level.Elevation - from_level.Elevation) * MM_PER_FOOT
+    relevel = _coerce_bool(item.get("relevel"), default=to_level is not None) and to_level is not None
+    if abs(dx) + abs(dy) + abs(dz) < 1e-6:
+        raise ValueError(u"{}: the copy has no offset (give to_level_name/from_level_name or delta_mm).".format(label))
+
+    fixtures = List[DB.ElementId]()
+    network = List[DB.ElementId]()
+    for raw in raw_ids:
+        element = _element_by_id(doc, raw, label)
+        if isinstance(element, DB.FamilyInstance) and not _is_fitting_like(element):
+            fixtures.Add(element.Id)
+        else:
+            network.Add(element.Id)
+    summary = {
+        "index": index,
+        "delta_mm": {"x": round(dx, 1), "y": round(dy, 1), "z": round(dz, 1)},
+        "fixture_count": fixtures.Count,
+        "pipe_and_fitting_count": network.Count,
+        "to_level": _name(to_level) if to_level is not None else None,
+    }
+    if is_dry_run:
+        return summary
+
+    move = DB.XYZ(_mm_to_ft(dx), _mm_to_ft(dy), _mm_to_ft(dz))
+    tolerance_ft = _mm_to_ft(0.5)
+    notes = []
+
+    new_fixtures = []
+    if fixtures.Count:
+        new_fixtures = [doc.GetElement(i) for i in DB.ElementTransformUtils.CopyElements(doc, fixtures, move)]
+        doc.Regenerate()
+        if relevel:
+            for fixture in new_fixtures:
+                before = _reference_point(fixture)
+                if not _set_param(fixture, DB.BuiltInParameter.FAMILY_LEVEL_PARAM, to_level.Id):
+                    notes.append(u"Fixture {} keeps its level (not writable).".format(get_element_id_text(fixture.Id)))
+                    continue
+                doc.Regenerate()
+                after = _reference_point(fixture)
+                if before is None or after is None:
+                    continue
+                shift = after.Z - before.Z
+                if abs(shift) <= tolerance_ft:
+                    continue
+                fixed = False
+                for bip in (DB.BuiltInParameter.INSTANCE_FREE_HOST_OFFSET_PARAM,
+                            DB.BuiltInParameter.INSTANCE_ELEVATION_PARAM):
+                    try:
+                        param = fixture.get_Parameter(bip)
+                        if param is not None and not param.IsReadOnly:
+                            param.Set(param.AsDouble() - shift)
+                            fixed = True
+                            break
+                    except Exception:
+                        pass
+                if not fixed:
+                    DB.ElementTransformUtils.MoveElement(doc, fixture.Id, DB.XYZ(0.0, 0.0, -shift))
+                doc.Regenerate()
+
+    new_network = []
+    if network.Count:
+        new_network = [doc.GetElement(i) for i in DB.ElementTransformUtils.CopyElements(doc, network, move)]
+        doc.Regenerate()
+        if relevel:
+            kept = 0
+            for element in new_network:
+                before = _reference_point(element)
+                if isinstance(element, DB.Plumbing.Pipe):
+                    done = _set_param(element, DB.BuiltInParameter.RBS_START_LEVEL_PARAM, to_level.Id)
+                else:
+                    done = _set_param(element, DB.BuiltInParameter.FAMILY_LEVEL_PARAM, to_level.Id)
+                if not done:
+                    kept += 1
+                    continue
+                doc.Regenerate()
+                after = _reference_point(element)
+                if before is not None and after is not None and before.DistanceTo(after) > tolerance_ft:
+                    raise ValueError(u"{}: element {} moved {} mm when its level was changed; nothing was "
+                                     u"copied. Retry with relevel=false.".format(
+                                         label, get_element_id_text(element.Id),
+                                         round(before.DistanceTo(after) * MM_PER_FOOT, 1)))
+            if kept:
+                notes.append(u"{} pipes/fittings keep their original level (parameter not writable).".format(kept))
+
+    # join the fixture copies to the pipe/fitting copies where open connectors coincide
+    joined = 0
+    if new_fixtures and new_network:
+        open_ends = []
+        for element in new_network:
+            for connector in _piping_connectors(element):
+                try:
+                    if not connector.IsConnected:
+                        open_ends.append(connector)
+                except Exception:
+                    pass
+        for fixture in new_fixtures:
+            for connector in _piping_connectors(fixture):
+                try:
+                    if connector.IsConnected:
+                        continue
+                    for other in open_ends:
+                        if other.IsConnected:
+                            continue
+                        if connector.Origin.DistanceTo(other.Origin) <= _mm_to_ft(1.0):
+                            connector.ConnectTo(other)
+                            joined += 1
+                            break
+                except Exception as join_error:
+                    notes.append(u"Could not join fixture {}: {}".format(
+                        get_element_id_text(fixture.Id), _text(join_error)))
+        doc.Regenerate()
+
+    summary["new_fixture_ids"] = [get_element_id_text(e.Id) for e in new_fixtures]
+    summary["new_pipe_and_fitting_ids"] = [get_element_id_text(e.Id) for e in new_network]
+    summary["fixture_joints_made"] = joined
+    summary["releveled"] = bool(relevel)
+    if notes:
+        summary["notes"] = notes[:30]
+    return summary
+
+
 def _rotate(doc, element_id, origin, axis, angle):
     if abs(angle) < 1e-9:
         return
@@ -919,7 +1091,15 @@ def _place_wye(doc, main, symbol, joint, branch_dir, label, branch_d_ft=None):
 
     ids = {}
     run_a, run_b, branch = _run_connector_pair(_piping_connectors(instance))
-    lean = run_a if _connector_dir(branch).DotProduct(_connector_dir(run_a)) > 0 else run_b
+    lean_dot = _connector_dir(branch).DotProduct(_connector_dir(run_a))
+    if abs(lean_dot) > 0.2:
+        lean = run_a if lean_dot > 0 else run_b
+    else:
+        # sanitary tee (順T): the branch is square to the run, so its direction says nothing.
+        # Its sweep enters nearer the upstream run end; pick the run end closer to the branch.
+        run_axis = run_b.Origin.Subtract(run_a.Origin)
+        middle = run_a.Origin.Add(run_b.Origin).Multiply(0.5)
+        lean = run_b if branch.Origin.Subtract(middle).DotProduct(run_axis) > 0 else run_a
     ids["lean"], ids["branch"] = lean.Id, branch.Id
 
     # 1) the leaning run end faces the side the branch comes from
@@ -1175,6 +1355,9 @@ def register_routes(api):
                 if not isinstance(item, dict):
                     raise ValueError(u"fittings[{}] must be an object.".format(index))
                 label = u"fittings[{}]".format(index)
+                if item.get("copy_element_ids") is not None:
+                    # utility mode: copy fixtures / pipes / fittings to another floor
+                    return _copy_elements(doc, item, label, index, is_dry_run)
                 if item.get("move_element_id") is not None:
                     # utility mode: move an existing element by delta_mm {x, y, z}
                     moved = _element_by_id(doc, item.get("move_element_id"), label)
