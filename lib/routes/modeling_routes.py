@@ -290,16 +290,20 @@ def _ensure_symbol_active(doc, symbol):
 # ---------------------------------------------------------------------------
 
 class _WarningCollector(DB.IFailuresPreprocessor):
-    """Deletes Revit warnings so no dialog blocks the route; records their text."""
+    """Deletes Revit warnings and rolls back on errors, so no dialog ever blocks the route
+    (a modal error dialog would hang every later request until someone clicks it);
+    records the text of both."""
 
     def __init__(self):
         self.warnings = []
         self.errors = []
 
     def PreprocessFailures(self, failures_accessor):
+        has_error = False
         try:
             for failure in failures_accessor.GetFailureMessages():
                 if failure.GetSeverity() != DB.FailureSeverity.Warning:
+                    has_error = True
                     try:
                         self.errors.append(_text(failure.GetDescriptionText()))
                     except Exception:
@@ -312,6 +316,8 @@ class _WarningCollector(DB.IFailuresPreprocessor):
                     failures_accessor.DeleteWarning(failure)
         except Exception:
             pass
+        if has_error:
+            return DB.FailureProcessingResult.ProceedWithRollBack
         return DB.FailureProcessingResult.Continue
 
 

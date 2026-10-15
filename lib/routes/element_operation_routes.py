@@ -23,6 +23,7 @@ class _WarningCollector(DB.IFailuresPreprocessor):
         self.sink = sink
 
     def PreprocessFailures(self, failures_accessor):
+        has_error = False
         try:
             for failure in failures_accessor.GetFailureMessages():
                 if failure.GetSeverity() == DB.FailureSeverity.Warning:
@@ -31,8 +32,17 @@ class _WarningCollector(DB.IFailuresPreprocessor):
                     except Exception:
                         pass
                     failures_accessor.DeleteWarning(failure)
+                else:
+                    has_error = True
+                    try:
+                        self.sink.append(u"Error (rolled back): " + failure.GetDescriptionText())
+                    except Exception:
+                        pass
         except Exception:
             pass
+        if has_error:
+            # roll back instead of letting Revit show a modal error dialog that hangs the server
+            return DB.FailureProcessingResult.ProceedWithRollBack
         return DB.FailureProcessingResult.Continue
 
 
