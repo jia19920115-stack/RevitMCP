@@ -1419,9 +1419,16 @@ def register_routes(api):
                         doc.Regenerate()
                     return {"index": index, "joined": not is_dry_run, "gap_mm": round(gap_mm, 2),
                             "moved_element_id": get_element_id_text(cb.Owner.Id)}
-                symbol = _symbol_by_family(
-                    doc, DB.BuiltInCategory.OST_PipeFitting,
-                    _merged(payload, item, "family_name"), _merged(payload, item, "type_name"), label)
+                try:
+                    symbol = _symbol_by_family(
+                        doc, DB.BuiltInCategory.OST_PipeFitting,
+                        _merged(payload, item, "family_name"), _merged(payload, item, "type_name"), label)
+                except ValueError:
+                    # end-of-pipe accessories (e.g. a fire department / test outlet) live in
+                    # Pipe Accessories, not Pipe Fittings
+                    symbol = _symbol_by_family(
+                        doc, DB.BuiltInCategory.OST_PipeAccessory,
+                        _merged(payload, item, "family_name"), _merged(payload, item, "type_name"), label)
                 target_spec = item.get("connect_to")
                 if not isinstance(target_spec, dict):
                     raise ValueError(u"{}: 'connect_to' {{element_id, connector_id?}} is required.".format(label))
