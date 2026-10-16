@@ -366,6 +366,20 @@ def _parse_length_to_internal_feet(value, default_unit=None):
     return _convert_length_magnitude_to_internal_feet(magnitude, unit)
 
 
+def _is_type_parameter(param):
+    """True for the instance's 'Type' / 'Family and Type' parameters."""
+    try:
+        definition = param.Definition
+        built_in = getattr(definition, "BuiltInParameter", None)
+        return built_in in (
+            DB.BuiltInParameter.ELEM_TYPE_PARAM,
+            DB.BuiltInParameter.ELEM_FAMILY_AND_TYPE_PARAM,
+            DB.BuiltInParameter.SYMBOL_ID_PARAM,
+        )
+    except Exception:
+        return False
+
+
 def _set_parameter_value(param, new_value):
     if param.StorageType == DB.StorageType.String:
         param.Set(str(new_value))
@@ -393,7 +407,7 @@ def _set_parameter_value(param, new_value):
             text = str(new_value).strip()
             target_id = None
             try:
-                target_id = DB.ElementId(int(text))
+                target_id = make_element_id(DB, int(text))
             except Exception:
                 target_id = None
             if target_id is None and doc is not None:
@@ -403,6 +417,11 @@ def _set_parameter_value(param, new_value):
                         break
             if target_id is None:
                 return False, "Could not resolve '{}' to an element id or level name".format(new_value)
+            # The type parameter is read-only through Parameter.Set; swap the type instead
+            # (e.g. a welded pipe fitting to the threaded family of the same part type).
+            if owner is not None and _is_type_parameter(param):
+                owner.ChangeTypeId(target_id)
+                return True, None
             if param.Set(target_id):
                 return True, None
             return False, "Revit rejected '{}' for this ElementId parameter".format(new_value)
