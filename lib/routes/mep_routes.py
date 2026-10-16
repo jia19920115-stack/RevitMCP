@@ -1358,6 +1358,21 @@ def register_routes(api):
                 if item.get("copy_element_ids") is not None:
                     # utility mode: copy fixtures / pipes / fittings to another floor
                     return _copy_elements(doc, item, label, index, is_dry_run)
+                if item.get("move_element_ids") is not None:
+                    # utility mode: move several elements together (connected pipes between
+                    # them keep their geometry; pipes outside the set stretch to follow)
+                    raw_ids = item.get("move_element_ids") or []
+                    moved_list = [_element_by_id(doc, raw, label) for raw in raw_ids]
+                    delta_spec = item.get("delta_mm") or {}
+                    dx = _to_float(delta_spec.get("x"), "delta_mm.x") or 0.0
+                    dy = _to_float(delta_spec.get("y"), "delta_mm.y") or 0.0
+                    dz = _to_float(delta_spec.get("z"), "delta_mm.z") or 0.0
+                    if not is_dry_run:
+                        id_list = List[DB.ElementId]([e.Id for e in moved_list])
+                        DB.ElementTransformUtils.MoveElements(
+                            doc, id_list, DB.XYZ(_mm_to_ft(dx), _mm_to_ft(dy), _mm_to_ft(dz)))
+                    return {"index": index, "element_ids": [get_element_id_text(e.Id) for e in moved_list],
+                            "moved": not is_dry_run, "delta_mm": {"x": dx, "y": dy, "z": dz}}
                 if item.get("move_element_id") is not None:
                     # utility mode: move an existing element by delta_mm {x, y, z}
                     moved = _element_by_id(doc, item.get("move_element_id"), label)
