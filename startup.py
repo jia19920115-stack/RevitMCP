@@ -211,6 +211,14 @@ try:
             logger.info("MEP routes registered successfully ({})".format(mep_routes.MEP_ROUTES_VERSION))
         except Exception as mep_error:
             logger.error("MEP routes failed to load: {}".format(mep_error), exc_info=True)
+
+        # Material routes (textured materials such as tiles).
+        try:
+            from routes import material_routes
+            material_routes.register_routes(api)
+            logger.info("Material routes registered successfully ({})".format(material_routes.MATERIAL_ROUTES_VERSION))
+        except Exception as material_error:
+            logger.error("Material routes failed to load: {}".format(material_error), exc_info=True)
         
     except ImportError as ie:
         import_error_message = str(ie)
