@@ -86,6 +86,32 @@ def failing_element_ids(failure):
     return ids
 
 
+def describe_failure(failure):
+    """One-line diagnostic: severity, definition guid and resolution types on offer."""
+    parts = []
+    try:
+        parts.append(u"severity={}".format(failure.GetSeverity()))
+    except Exception:
+        pass
+    try:
+        parts.append(u"def={}".format(failure.GetFailureDefinitionId().Guid))
+    except Exception:
+        pass
+    offered = []
+    for name in dir(DB.FailureResolutionType):
+        if name.startswith("_"):
+            continue
+        try:
+            resolution_type = getattr(DB.FailureResolutionType, name)
+            if isinstance(resolution_type, DB.FailureResolutionType) and failure.HasResolutionOfType(resolution_type):
+                offered.append(name)
+        except Exception:
+            pass
+    parts.append(u"resolutions={}".format(u",".join(offered)))
+    parts.append(u"elements={}".format(failing_element_ids(failure)))
+    return u" ".join(parts)
+
+
 def try_resolve_join_failure(failures_accessor, failure):
     """
     Resolve one join failure with "Unjoin Elements". Returns a dict describing what was done, or None when the

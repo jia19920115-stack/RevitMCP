@@ -26,7 +26,7 @@ from System.Collections.Generic import List
 
 from routes.json_safety import sanitize_for_json
 from routes.revit_compat import get_element_id_text, get_element_id_value, make_element_id
-from routes.failure_handling import try_resolve_join_failure
+from routes.failure_handling import try_resolve_join_failure, describe_failure
 
 
 MM_PER_FOOT = 304.8
@@ -307,7 +307,11 @@ class _WarningCollector(DB.IFailuresPreprocessor):
             for failure in failures_accessor.GetFailureMessages():
                 if failure.GetSeverity() != DB.FailureSeverity.Warning:
                     # "Can't cut joined element" etc.: unjoin that pair instead of losing the batch
-                    unjoined = try_resolve_join_failure(failures_accessor, failure)
+                    try:
+                        unjoined = try_resolve_join_failure(failures_accessor, failure)
+                    except Exception as resolve_error:
+                        unjoined = None
+                        self.errors.append(u"preprocessor exception: {}".format(_text(resolve_error)))
                     if unjoined is not None:
                         resolved = True
                         self.auto_unjoined.append(unjoined)
@@ -317,6 +321,7 @@ class _WarningCollector(DB.IFailuresPreprocessor):
                     has_error = True
                     try:
                         self.errors.append(_text(failure.GetDescriptionText()))
+                        self.errors.append(describe_failure(failure))
                     except Exception:
                         pass
                 if failure.GetSeverity() == DB.FailureSeverity.Warning:
@@ -325,8 +330,10 @@ class _WarningCollector(DB.IFailuresPreprocessor):
                     except Exception:
                         pass
                     failures_accessor.DeleteWarning(failure)
-        except Exception:
-            pass
+        except Exception as preprocess_error:
+            # never fall through to Continue: that would show a modal error dialog
+            self.errors.append(u"preprocessor exception: {}".format(_text(preprocess_error)))
+            return DB.FailureProcessingResult.ProceedWithRollBack
         if has_error:
             return DB.FailureProcessingResult.ProceedWithRollBack
         if resolved:
@@ -2148,38 +2155,45 @@ def register_routes(api):
                 return sanitize_for_json(result)
 
             collector_warnings = _WarningCollector()
-            transaction = DB.Transaction(doc, "RevitMCP Apply Join Priority")
-            options = transaction.GetFailureHandlingOptions()
-            options.SetFailuresPreprocessor(collector_warnings)
-            transaction.SetFailureHandlingOptions(options)
-            transaction.Start()
             joined = switched = unchanged = 0
             failed = []
-            try:
-                for high, low in pairs:
-                    sub = DB.SubTransaction(doc)
-                    sub.Start()
+            # one transaction per pair: a pair Revit refuses to cut is rolled back alone
+            # (no modal dialog) and the rest still get joined
+            for high, low in pairs:
+                collector_warnings.errors = []
+                transaction = DB.Transaction(doc, "RevitMCP Apply Join Priority")
+                options = transaction.GetFailureHandlingOptions()
+                options.SetFailuresPreprocessor(collector_warnings)
+                options.SetClearAfterRollback(True)
+                transaction.SetFailureHandlingOptions(options)
+                transaction.Start()
+                pair_joined = pair_switched = pair_unchanged = 0
+                try:
+                    if not DB.JoinGeometryUtils.AreElementsJoined(doc, high, low):
+                        DB.JoinGeometryUtils.JoinGeometry(doc, high, low)
+                        pair_joined = 1
+                    else:
+                        pair_unchanged = 1
+                    if not DB.JoinGeometryUtils.IsCuttingElementInJoin(doc, high, low):
+                        DB.JoinGeometryUtils.SwitchJoinOrder(doc, high, low)
+                        pair_switched = 1
+                    pair_status = transaction.Commit()
+                except Exception as pair_error:
                     try:
-                        if not DB.JoinGeometryUtils.AreElementsJoined(doc, high, low):
-                            DB.JoinGeometryUtils.JoinGeometry(doc, high, low)
-                            joined += 1
-                        else:
-                            unchanged += 1
-                        if not DB.JoinGeometryUtils.IsCuttingElementInJoin(doc, high, low):
-                            DB.JoinGeometryUtils.SwitchJoinOrder(doc, high, low)
-                            switched += 1
-                        sub.Commit()
-                    except Exception as pair_error:
-                        try:
-                            sub.RollBack()
-                        except Exception:
-                            pass
-                        failed.append({"pair": describe(high, low), "error": _text(pair_error)})
-                status = transaction.Commit()
-            except Exception:
-                if transaction.HasStarted() and not transaction.HasEnded():
-                    transaction.RollBack()
-                raise
+                        if transaction.HasStarted() and not transaction.HasEnded():
+                            transaction.RollBack()
+                    except Exception:
+                        pass
+                    failed.append({"pair": describe(high, low), "error": _text(pair_error)})
+                    continue
+                if pair_status == DB.TransactionStatus.Committed:
+                    joined += pair_joined
+                    switched += pair_switched
+                    unchanged += pair_unchanged
+                else:
+                    failed.append({"pair": describe(high, low),
+                                   "error": u"rolled back: {}".format(u" | ".join(collector_warnings.errors[:4]))})
+            status = u"per-pair transactions"
 
             result.update({
                 "status": "success" if not failed else ("partial_success" if (joined or switched) else "error"),
@@ -2191,7 +2205,7 @@ def register_routes(api):
                 "warnings": collector_warnings.warnings[:50],
                 "auto_unjoined": collector_warnings.auto_unjoined[:50],
                 "transaction": _text(status),
-                "undo_hint": u"One Ctrl+Z in Revit undoes this whole call.",
+                "undo_hint": u"One Ctrl+Z per joined pair in Revit.",
             })
             return sanitize_for_json(result)
         except Exception as e:

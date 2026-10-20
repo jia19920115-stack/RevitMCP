@@ -46,8 +46,10 @@ class _WarningCollector(DB.IFailuresPreprocessor):
                         self.sink.append(u"Error (rolled back): " + failure.GetDescriptionText())
                     except Exception:
                         pass
-        except Exception:
-            pass
+        except Exception as preprocess_error:
+            # never fall through to Continue: that would show a modal error dialog
+            self.sink.append(u"preprocessor exception: {}".format(preprocess_error))
+            return DB.FailureProcessingResult.ProceedWithRollBack
         if has_error:
             # roll back instead of letting Revit show a modal error dialog that hangs the server
             return DB.FailureProcessingResult.ProceedWithRollBack
