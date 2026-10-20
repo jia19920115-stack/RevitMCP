@@ -2223,7 +2223,7 @@ def register_routes(api):
 
             walls = []
             for raw in raw_ids:
-                wall = doc.GetElement(make_element_id(int(_text(raw))))
+                wall = doc.GetElement(make_element_id(DB, int(_text(raw))))
                 if not isinstance(wall, DB.Wall):
                     raise ValueError(u"Element {} is not a wall.".format(_text(raw)))
                 walls.append(wall)
