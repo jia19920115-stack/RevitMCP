@@ -49,6 +49,14 @@ try:
 
     from routes.revit_compat import get_element_id_text
 
+    # Auto-resolve "can't cut joined element" errors (Unjoin Elements) during manual
+    # work too, so the dialog never blocks Revit or the MCP server.
+    try:
+        from routes import failure_handling
+        failure_handling.register_application_handler(__revit__.Application, logger)
+    except Exception as failure_handler_error:
+        logger.error("Join-failure handler not registered: {}".format(failure_handler_error))
+
     @api.route('/diagnostics/revit_state', methods=['GET', 'POST'])
     def handle_get_revit_diagnostics(uiapp, uidoc, doc, request):
         """Always-on startup diagnostic route. Delegates to element_routes when available."""

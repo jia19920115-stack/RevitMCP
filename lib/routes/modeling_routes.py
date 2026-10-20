@@ -26,6 +26,7 @@ from System.Collections.Generic import List
 
 from routes.json_safety import sanitize_for_json
 from routes.revit_compat import get_element_id_text, get_element_id_value, make_element_id
+from routes.failure_handling import try_resolve_join_failure
 
 
 MM_PER_FOOT = 304.8
@@ -297,12 +298,22 @@ class _WarningCollector(DB.IFailuresPreprocessor):
     def __init__(self):
         self.warnings = []
         self.errors = []
+        self.auto_unjoined = []
 
     def PreprocessFailures(self, failures_accessor):
         has_error = False
+        resolved = False
         try:
             for failure in failures_accessor.GetFailureMessages():
                 if failure.GetSeverity() != DB.FailureSeverity.Warning:
+                    # "Can't cut joined element" etc.: unjoin that pair instead of losing the batch
+                    unjoined = try_resolve_join_failure(failures_accessor, failure)
+                    if unjoined is not None:
+                        resolved = True
+                        self.auto_unjoined.append(unjoined)
+                        self.warnings.append(u"Auto-unjoined {}: {}".format(
+                            unjoined["element_ids"], unjoined["message"]))
+                        continue
                     has_error = True
                     try:
                         self.errors.append(_text(failure.GetDescriptionText()))
@@ -318,6 +329,8 @@ class _WarningCollector(DB.IFailuresPreprocessor):
             pass
         if has_error:
             return DB.FailureProcessingResult.ProceedWithRollBack
+        if resolved:
+            return DB.FailureProcessingResult.ProceedWithCommit
         return DB.FailureProcessingResult.Continue
 
 
@@ -2176,6 +2189,7 @@ def register_routes(api):
                 "already_joined": unchanged,
                 "failed": failed[:50],
                 "warnings": collector_warnings.warnings[:50],
+                "auto_unjoined": collector_warnings.auto_unjoined[:50],
                 "transaction": _text(status),
                 "undo_hint": u"One Ctrl+Z in Revit undoes this whole call.",
             })

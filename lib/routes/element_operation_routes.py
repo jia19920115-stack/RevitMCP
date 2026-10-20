@@ -7,6 +7,7 @@ from System.Collections.Generic import List
 
 from routes.json_safety import sanitize_for_json
 from routes.revit_compat import get_element_id_text, make_element_id
+from routes.failure_handling import try_resolve_join_failure
 
 
 try:
@@ -24,6 +25,7 @@ class _WarningCollector(DB.IFailuresPreprocessor):
 
     def PreprocessFailures(self, failures_accessor):
         has_error = False
+        resolved = False
         try:
             for failure in failures_accessor.GetFailureMessages():
                 if failure.GetSeverity() == DB.FailureSeverity.Warning:
@@ -32,6 +34,12 @@ class _WarningCollector(DB.IFailuresPreprocessor):
                     except Exception:
                         pass
                     failures_accessor.DeleteWarning(failure)
+                    continue
+                # "Can't cut joined element" etc.: unjoin that pair instead of rolling back
+                unjoined = try_resolve_join_failure(failures_accessor, failure)
+                if unjoined is not None:
+                    resolved = True
+                    self.sink.append(u"Auto-unjoined {}: {}".format(unjoined["element_ids"], unjoined["message"]))
                 else:
                     has_error = True
                     try:
@@ -43,6 +51,8 @@ class _WarningCollector(DB.IFailuresPreprocessor):
         if has_error:
             # roll back instead of letting Revit show a modal error dialog that hangs the server
             return DB.FailureProcessingResult.ProceedWithRollBack
+        if resolved:
+            return DB.FailureProcessingResult.ProceedWithCommit
         return DB.FailureProcessingResult.Continue
 
 
