@@ -1302,8 +1302,19 @@ def _create_profile_wall(doc, index, item, profile_raw, start, end, base_level, 
     if bbox is not None:
         shift = min(zs) - bbox.Min.Z
         if abs(shift) * MM_PER_FOOT > 1.0:
-            DB.ElementTransformUtils.MoveElement(doc, wall.Id, DB.XYZ(0, 0, shift))
+            lifted = False
+            offset_param = wall.get_Parameter(DB.BuiltInParameter.WALL_BASE_OFFSET)
+            if offset_param is not None and not offset_param.IsReadOnly:
+                offset_param.Set(offset_param.AsDouble() + shift)
+                lifted = True
+            if not lifted:
+                DB.ElementTransformUtils.MoveElement(doc, wall.Id, DB.XYZ(0, 0, shift))
+            doc.Regenerate()
+            after = wall.get_BoundingBox(None)
             summary["lifted_mm"] = _ft_to_mm(shift)
+            summary["lifted_by"] = "base_offset" if lifted else "move"
+            if after is not None:
+                summary["actual_bottom_mm"] = _ft_to_mm(after.Min.Z - base_level.Elevation)
     summary["element_id"] = get_element_id_text(wall.Id)
     return summary
 
