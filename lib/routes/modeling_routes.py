@@ -1296,6 +1296,14 @@ def _create_profile_wall(doc, index, item, profile_raw, start, end, base_level, 
     for i, point in enumerate(points):
         curve_list.Add(DB.Line.CreateBound(point, points[(i + 1) % len(points)]))
     wall = DB.Wall.Create(doc, curve_list, wall_type.Id, base_level.Id, structural)
+    # Revit drops the profile onto the base level; lift the wall back to the requested height.
+    doc.Regenerate()
+    bbox = wall.get_BoundingBox(None)
+    if bbox is not None:
+        shift = min(zs) - bbox.Min.Z
+        if abs(shift) * MM_PER_FOOT > 1.0:
+            DB.ElementTransformUtils.MoveElement(doc, wall.Id, DB.XYZ(0, 0, shift))
+            summary["lifted_mm"] = _ft_to_mm(shift)
     summary["element_id"] = get_element_id_text(wall.Id)
     return summary
 
