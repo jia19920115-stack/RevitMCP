@@ -2334,10 +2334,13 @@ def register_routes(api):
                 if transaction.HasStarted() and not transaction.HasEnded():
                     transaction.RollBack()
                 raise
+            committed = status == DB.TransactionStatus.Committed
             result.update({
-                "status": "success",
-                "message": u"Copied walls to {} levels.".format(len(to_levels)),
+                "status": "success" if committed else "error",
+                "message": (u"Copied walls to {} levels.".format(len(to_levels)) if committed else
+                            u"Revit rolled the whole copy back; nothing was copied."),
                 "levels": per_level,
+                "errors": collector_w.errors[:50],
                 "warnings": collector_w.warnings[:50],
                 "auto_unjoined": collector_w.auto_unjoined[:50],
                 "transaction": _text(status),
