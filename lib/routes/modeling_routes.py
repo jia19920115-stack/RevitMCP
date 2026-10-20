@@ -2408,7 +2408,7 @@ def register_routes(api):
                       "to_levels": [_name(l) for l in to_levels]}
             if dry_run:
                 result["status"] = "dry_run"
-                result["groups"] = [{"id": get_element_id_text(g.Id), "type": _text(g.GroupType.Name),
+                result["groups"] = [{"id": get_element_id_text(g.Id), "type": _name(g.GroupType),
                                      "members": len(list(g.GetMemberIds()))} for g in groups]
                 result["message"] = u"Dry run: {} groups x {} levels would be placed.".format(len(groups), len(to_levels))
                 return sanitize_for_json(result)
@@ -2450,7 +2450,7 @@ def register_routes(api):
                             u" | ".join(collector_w.errors[:4]))})
                         continue
                     entry["placed"].append({"source": gid, "new_group": get_element_id_text(new_group.Id),
-                                            "type": _text(new_group.GroupType.Name),
+                                            "type": _name(new_group.GroupType),
                                             "z_error_mm": shift_error_mm})
                 per_level.append(entry)
             all_failed = any(e["failed"] for e in per_level)
