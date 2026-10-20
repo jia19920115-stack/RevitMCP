@@ -2242,13 +2242,22 @@ def register_routes(api):
                 return base, top
 
             plan = []
+            skipped_profile = []
             for wall in walls:
+                # a wall with an edited elevation profile has a sketch that breaks when copied
+                try:
+                    if wall.SketchId != DB.ElementId.InvalidElementId:
+                        skipped_profile.append(get_element_id_text(wall.Id))
+                        continue
+                except Exception:
+                    pass
                 base, top = wall_levels(wall)
                 if base is None or abs(base.Elevation - from_level.Elevation) > 1e-3:
                     raise ValueError(u"Wall {} is not based on {}.".format(get_element_id_text(wall.Id), _name(from_level)))
                 plan.append((wall, base, top))
 
-            result = {"wall_count": len(walls), "from_level": _name(from_level),
+            result = {"wall_count": len(plan), "skipped_edited_profile": skipped_profile,
+                      "from_level": _name(from_level),
                       "to_levels": [_name(l) for l in to_levels]}
             if dry_run:
                 result["status"] = "dry_run"
