@@ -2175,28 +2175,60 @@ def register_routes(api):
             for e in candidates:
                 id_list.Add(e.Id)
 
+            def _is_finish_wall(el):
+                try:
+                    return el.Category is not None and \
+                        get_element_id_value(el.Category.Id) == int(DB.BuiltInCategory.OST_Walls) and \
+                        _name(doc.GetElement(el.GetTypeId())).startswith(u"\u88dd\u4fee")
+                except Exception:
+                    return False
+
+            def _bbox_hits(a):
+                out = []
+                ba = a.get_BoundingBox(None)
+                if ba is None:
+                    return out
+                tol = _mm_to_ft(1.0)
+                for other in candidates:
+                    if get_element_id_value(other.Id) == get_element_id_value(a.Id):
+                        continue
+                    bo = other.get_BoundingBox(None)
+                    if bo is None:
+                        continue
+                    if (ba.Min.X < bo.Max.X - tol and bo.Min.X < ba.Max.X - tol and
+                            ba.Min.Y < bo.Max.Y - tol and bo.Min.Y < ba.Max.Y - tol and
+                            ba.Min.Z < bo.Max.Z - tol and bo.Min.Z < ba.Max.Z - tol):
+                        out.append(other)
+                return out
+
             pairs = []
             seen = set()
             if id_list.Count > 1:
                 for a in candidates:
                     pa = _priority_of(a, prio_map)
                     try:
-                        hits = (DB.FilteredElementCollector(doc, id_list)
-                                .WherePasses(DB.ElementIntersectsElementFilter(a))
-                                .ToElements())
+                        hits = list(DB.FilteredElementCollector(doc, id_list)
+                                    .WherePasses(DB.ElementIntersectsElementFilter(a))
+                                    .ToElements())
                     except Exception:
-                        continue
+                        hits = []
+                    if not hits:
+                        # the solid filter misses some profile-edited walls: fall back to bounding boxes;
+                        # JoinGeometry refuses non-touching pairs per pair below
+                        hits = _bbox_hits(a)
                     for b in hits:
                         if get_element_id_value(b.Id) == get_element_id_value(a.Id):
                             continue
                         pb = _priority_of(b, prio_map)
-                        if pb is None or pb[0] == pa[0]:
+                        if pb is None:
+                            continue
+                        if pb[0] == pa[0] and not (_is_finish_wall(a) and _is_finish_wall(b)):
                             continue
                         key = tuple(sorted((get_element_id_value(a.Id), get_element_id_value(b.Id))))
                         if key in seen:
                             continue
                         seen.add(key)
-                        high, low = (a, b) if pa[0] > pb[0] else (b, a)
+                        high, low = (a, b) if pa[0] >= pb[0] else (b, a)
                         pairs.append((high, low))
                         if len(pairs) > max_pairs:
                             raise ValueError(u"More than {} overlapping pairs; narrow the scope "
