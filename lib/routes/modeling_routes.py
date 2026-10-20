@@ -2374,6 +2374,98 @@ def register_routes(api):
             route_logger.error("Error in /modeling/copy_walls_to_levels: {}".format(e), exc_info=True)
             return _error(_text(e))
 
+    # ------------------------------------------------------- place groups
+    @api.route('/modeling/place_groups_to_levels', methods=['POST'])
+    def handle_place_groups_to_levels(doc, request):
+        """Place instances of existing model groups on other levels (same XY, shifted by the level difference)."""
+        route_logger = script.get_logger()
+        try:
+            _check_document(doc)
+            payload = request.data if hasattr(request, "data") else {}
+            if payload is None or not isinstance(payload, dict):
+                raise ValueError(u"Invalid JSON payload.")
+            dry_run = _coerce_bool(payload.get("dry_run"), default=False)
+            raw_ids = payload.get("group_ids")
+            if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+                raise ValueError(u"group_ids must be a non-empty list of group instance ids.")
+            from_level = _find_level(doc, payload.get("from_level_name"), "from_level_name")
+            to_names = payload.get("to_level_names")
+            if not isinstance(to_names, (list, tuple)) or not to_names:
+                raise ValueError(u"to_level_names must be a non-empty list.")
+            to_levels = [_find_level(doc, n, "to_level_names") for n in to_names]
+            tolerance_ft = _mm_to_ft(5.0)
+
+            groups = []
+            for raw in raw_ids:
+                group = doc.GetElement(make_element_id(DB, int(_text(raw))))
+                if not isinstance(group, DB.Group):
+                    raise ValueError(u"Element {} is not a group instance.".format(_text(raw)))
+                if not isinstance(group.Location, DB.LocationPoint):
+                    raise ValueError(u"Group {} has no point location.".format(_text(raw)))
+                groups.append(group)
+
+            result = {"group_count": len(groups), "from_level": _name(from_level),
+                      "to_levels": [_name(l) for l in to_levels]}
+            if dry_run:
+                result["status"] = "dry_run"
+                result["groups"] = [{"id": get_element_id_text(g.Id), "type": _text(g.GroupType.Name),
+                                     "members": len(list(g.GetMemberIds()))} for g in groups]
+                result["message"] = u"Dry run: {} groups x {} levels would be placed.".format(len(groups), len(to_levels))
+                return sanitize_for_json(result)
+
+            collector_w = _WarningCollector()
+            per_level = []
+            for to_level in to_levels:
+                dz = to_level.Elevation - from_level.Elevation
+                entry = {"level": _name(to_level), "placed": [], "failed": []}
+                for group in groups:
+                    collector_w.errors = []
+                    transaction = DB.Transaction(doc, "RevitMCP Place Group")
+                    options = transaction.GetFailureHandlingOptions()
+                    options.SetFailuresPreprocessor(collector_w)
+                    options.SetClearAfterRollback(True)
+                    transaction.SetFailureHandlingOptions(options)
+                    transaction.Start()
+                    gid = get_element_id_text(group.Id)
+                    try:
+                        origin = group.Location.Point
+                        before = group.get_BoundingBox(None)
+                        new_group = doc.Create.PlaceGroup(DB.XYZ(origin.X, origin.Y, origin.Z + dz), group.GroupType)
+                        doc.Regenerate()
+                        shift_error_mm = None
+                        after = new_group.get_BoundingBox(None)
+                        if before is not None and after is not None:
+                            shift_error_mm = _ft_to_mm((after.Min.Z - before.Min.Z) - dz)
+                        pair_status = transaction.Commit()
+                    except Exception as place_error:
+                        try:
+                            if transaction.HasStarted() and not transaction.HasEnded():
+                                transaction.RollBack()
+                        except Exception:
+                            pass
+                        entry["failed"].append({"group": gid, "error": _text(place_error)})
+                        continue
+                    if pair_status != DB.TransactionStatus.Committed:
+                        entry["failed"].append({"group": gid, "error": u"rolled back: {}".format(
+                            u" | ".join(collector_w.errors[:4]))})
+                        continue
+                    entry["placed"].append({"source": gid, "new_group": get_element_id_text(new_group.Id),
+                                            "type": _text(new_group.GroupType.Name),
+                                            "z_error_mm": shift_error_mm})
+                per_level.append(entry)
+            all_failed = any(e["failed"] for e in per_level)
+            result.update({
+                "status": "partial_success" if all_failed else "success",
+                "levels": per_level,
+                "warnings": collector_w.warnings[:50],
+                "auto_unjoined": collector_w.auto_unjoined[:50],
+                "undo_hint": u"One Ctrl+Z per placed group.",
+            })
+            return sanitize_for_json(result)
+        except Exception as e:
+            route_logger.error("Error in /modeling/place_groups_to_levels: {}".format(e), exc_info=True)
+            return _error(_text(e))
+
     # ------------------------------------------------------------- ceilings
     @api.route('/modeling/create_ceilings', methods=['POST'])
     def handle_create_ceilings(doc, request):
