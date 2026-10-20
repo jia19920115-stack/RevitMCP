@@ -2198,6 +2198,156 @@ def register_routes(api):
             route_logger.error("Error in /modeling/apply_join_priority: {}".format(e), exc_info=True)
             return _error(_text(e))
 
+    # ------------------------------------------------------- copy to level
+    @api.route('/modeling/copy_walls_to_levels', methods=['POST'])
+    def handle_copy_walls_to_levels(doc, request):
+        """Copy walls (e.g. finish layers) from one level to other levels, same XY, re-constrained to the new levels."""
+        route_logger = script.get_logger()
+        try:
+            _check_document(doc)
+            payload = request.data if hasattr(request, "data") else {}
+            if payload is None or not isinstance(payload, dict):
+                raise ValueError(u"Invalid JSON payload.")
+            dry_run = _coerce_bool(payload.get("dry_run"), default=False)
+            raw_ids = payload.get("element_ids")
+            if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+                raise ValueError(u"element_ids must be a non-empty list of wall ids.")
+            from_level = _find_level(doc, payload.get("from_level_name"), "from_level_name")
+            to_names = payload.get("to_level_names")
+            if not isinstance(to_names, (list, tuple)) or not to_names:
+                raise ValueError(u"to_level_names must be a non-empty list.")
+            to_levels = [_find_level(doc, n, "to_level_names") for n in to_names]
+            skip_unmatched = _coerce_bool(payload.get("skip_unmatched"), default=True)
+            host_gap_ft = _mm_to_ft(_to_float(payload.get("host_gap_mm"), "host_gap_mm", default=40.0))
+            exclude_prefix = _text(payload.get("exclude_host_name_prefix"))
+
+            walls = []
+            for raw in raw_ids:
+                wall = doc.GetElement(make_element_id(int(_text(raw))))
+                if not isinstance(wall, DB.Wall):
+                    raise ValueError(u"Element {} is not a wall.".format(_text(raw)))
+                walls.append(wall)
+            levels = _all_levels(doc)
+
+            def level_at(elevation_ft):
+                for lv in levels:
+                    if abs(lv.Elevation - elevation_ft) < 1e-3:
+                        return lv
+                return None
+
+            def wall_levels(wall):
+                base = doc.GetElement(wall.get_Parameter(DB.BuiltInParameter.WALL_BASE_CONSTRAINT).AsElementId())
+                top_id = wall.get_Parameter(DB.BuiltInParameter.WALL_HEIGHT_TYPE).AsElementId()
+                top = doc.GetElement(top_id) if top_id != DB.ElementId.InvalidElementId else None
+                return base, top
+
+            plan = []
+            for wall in walls:
+                base, top = wall_levels(wall)
+                if base is None or abs(base.Elevation - from_level.Elevation) > 1e-3:
+                    raise ValueError(u"Wall {} is not based on {}.".format(get_element_id_text(wall.Id), _name(from_level)))
+                plan.append((wall, base, top))
+
+            result = {"wall_count": len(walls), "from_level": _name(from_level),
+                      "to_levels": [_name(l) for l in to_levels]}
+            if dry_run:
+                result["status"] = "dry_run"
+                result["message"] = u"Dry run: {} walls x {} levels would be copied.".format(len(walls), len(to_levels))
+                return sanitize_for_json(result)
+
+            collector_w = _WarningCollector()
+            transaction = DB.Transaction(doc, "RevitMCP Copy Walls To Levels")
+            options = transaction.GetFailureHandlingOptions()
+            options.SetFailuresPreprocessor(collector_w)
+            transaction.SetFailureHandlingOptions(options)
+            transaction.Start()
+            per_level = []
+            try:
+                for to_level in to_levels:
+                    dz = to_level.Elevation - from_level.Elevation
+                    source_ids = List[DB.ElementId]()
+                    for wall, _b, _t in plan:
+                        source_ids.Add(wall.Id)
+                    sub = DB.SubTransaction(doc)
+                    sub.Start()
+                    new_ids = DB.ElementTransformUtils.CopyElements(doc, source_ids, DB.XYZ(0, 0, dz))
+                    doc.Regenerate()
+                    new_walls = [doc.GetElement(i) for i in new_ids]
+                    new_walls = [w for w in new_walls if isinstance(w, DB.Wall)]
+                    new_id_values = set(get_element_id_value(w.Id) for w in new_walls)
+                    # CopyElements returns the copies in source order
+                    entry = {"level": _name(to_level), "copied": 0, "created_ids": [], "no_top_level": [],
+                             "no_host": [], "removed": [], "errors": []}
+                    for (wall, base, top), copy in zip(plan, new_walls):
+                        cid = get_element_id_text(copy.Id)
+                        try:
+                            base_off = wall.get_Parameter(DB.BuiltInParameter.WALL_BASE_OFFSET).AsDouble()
+                            copy.get_Parameter(DB.BuiltInParameter.WALL_BASE_CONSTRAINT).Set(to_level.Id)
+                            copy.get_Parameter(DB.BuiltInParameter.WALL_BASE_OFFSET).Set(base_off)
+                            if top is not None:
+                                new_top = level_at(top.Elevation + dz)
+                                if new_top is None:
+                                    entry["no_top_level"].append(cid)
+                                else:
+                                    top_off = wall.get_Parameter(DB.BuiltInParameter.WALL_TOP_OFFSET).AsDouble()
+                                    copy.get_Parameter(DB.BuiltInParameter.WALL_HEIGHT_TYPE).Set(new_top.Id)
+                                    copy.get_Parameter(DB.BuiltInParameter.WALL_TOP_OFFSET).Set(top_off)
+                        except Exception as copy_error:
+                            entry["errors"].append({"id": cid, "error": _text(copy_error)})
+                        entry["created_ids"].append(cid)
+                    doc.Regenerate()
+
+                    # finish walls with no host wall/column beside them on the new floor
+                    if skip_unmatched:
+                        host_filter = DB.ElementMulticategoryFilter(List[DB.BuiltInCategory](
+                            [DB.BuiltInCategory.OST_Walls, DB.BuiltInCategory.OST_StructuralColumns]))
+                        hosts = [e for e in (DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
+                                             .WherePasses(host_filter).ToElements())
+                                 if get_element_id_value(e.Id) not in new_id_values
+                                 and not (isinstance(e, DB.Wall) and exclude_prefix and
+                                          _text(e.WallType.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM).AsString()
+                                                ).startswith(exclude_prefix))]
+                        boxes = []
+                        mid = to_level.Elevation + _mm_to_ft(1000.0)
+                        for e in hosts:
+                            box = e.get_BoundingBox(None)
+                            if box is not None and box.Min.Z < mid < box.Max.Z:
+                                boxes.append(box)
+                        for copy in new_walls:
+                            box = copy.get_BoundingBox(None)
+                            if box is None:
+                                continue
+                            hit = any(box.Min.X < b.Max.X + host_gap_ft and b.Min.X < box.Max.X + host_gap_ft and
+                                      box.Min.Y < b.Max.Y + host_gap_ft and b.Min.Y < box.Max.Y + host_gap_ft
+                                      for b in boxes)
+                            if not hit:
+                                cid = get_element_id_text(copy.Id)
+                                entry["no_host"].append(cid)
+                                doc.Delete(copy.Id)
+                                entry["created_ids"].remove(cid)
+                                entry["removed"].append(cid)
+                    entry["copied"] = len(entry["created_ids"])
+                    sub.Commit()
+                    per_level.append(entry)
+                status = transaction.Commit()
+            except Exception:
+                if transaction.HasStarted() and not transaction.HasEnded():
+                    transaction.RollBack()
+                raise
+            result.update({
+                "status": "success",
+                "message": u"Copied walls to {} levels.".format(len(to_levels)),
+                "levels": per_level,
+                "warnings": collector_w.warnings[:50],
+                "auto_unjoined": collector_w.auto_unjoined[:50],
+                "transaction": _text(status),
+                "undo_hint": u"One Ctrl+Z in Revit undoes this whole call.",
+            })
+            return sanitize_for_json(result)
+        except Exception as e:
+            route_logger.error("Error in /modeling/copy_walls_to_levels: {}".format(e), exc_info=True)
+            return _error(_text(e))
+
     # ------------------------------------------------------------- ceilings
     @api.route('/modeling/create_ceilings', methods=['POST'])
     def handle_create_ceilings(doc, request):

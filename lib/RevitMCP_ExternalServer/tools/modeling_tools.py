@@ -347,6 +347,28 @@ def apply_join_priority_handler(
     })
 
 
+def copy_walls_to_levels_handler(
+    services,
+    element_ids: list = None,
+    from_level_name: str = None,
+    to_level_names: list = None,
+    skip_unmatched: bool = None,
+    host_gap_mm: float = None,
+    exclude_host_name_prefix: str = None,
+    dry_run: bool = None,
+    **_kwargs,
+) -> dict:
+    return _call(services, "copy_walls_to_levels", "/modeling/copy_walls_to_levels", {
+        "element_ids": element_ids,
+        "from_level_name": from_level_name,
+        "to_level_names": to_level_names,
+        "skip_unmatched": skip_unmatched,
+        "host_gap_mm": host_gap_mm,
+        "exclude_host_name_prefix": exclude_host_name_prefix,
+        "dry_run": dry_run,
+    })
+
+
 def create_ceilings_handler(
     services,
     ceilings: list = None,
@@ -737,6 +759,30 @@ def build_modeling_tools() -> list[ToolDefinition]:
                 },
             },
             handler=apply_join_priority_handler,
+        ),
+        ToolDefinition(
+            name="copy_walls_to_levels",
+            description=(
+                "Copies walls (e.g. finish layers 裝修_打底/粉光/油漆/壁磚) from from_level_name to each level in "
+                "to_level_names at the same XY, re-constraining base/top to the new levels and keeping offsets and "
+                "types. skip_unmatched (default true) removes copies that have no wall/column beside them on the "
+                "target floor (partitions that differ) and lists them under no_host. exclude_host_name_prefix "
+                "(e.g. 裝修_) keeps other finish walls from counting as hosts. One transaction; supports dry_run."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "element_ids": {"type": "array", "items": {"type": "string"}},
+                    "from_level_name": {"type": "string"},
+                    "to_level_names": {"type": "array", "items": {"type": "string"}},
+                    "skip_unmatched": {"type": "boolean"},
+                    "host_gap_mm": {"type": "number", "description": "Max gap to a host. Default 40."},
+                    "exclude_host_name_prefix": {"type": "string"},
+                    "dry_run": {"type": "boolean"},
+                },
+                "required": ["element_ids", "from_level_name", "to_level_names"],
+            },
+            handler=copy_walls_to_levels_handler,
         ),
         ToolDefinition(
             name="create_ceilings",
