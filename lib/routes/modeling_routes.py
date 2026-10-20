@@ -1250,6 +1250,56 @@ def _vertex_list(editor, floor_top):
 # Routes
 # ---------------------------------------------------------------------------
 
+def _create_profile_wall(doc, index, item, profile_raw, start, end, base_level, wall_type, structural,
+                         is_dry_run):
+    """Wall whose elevation outline is a polygon (e.g. a sloped top following a stair run).
+
+    profile: [[along_mm, z_mm], ...] where along_mm is measured from start toward end and z_mm is
+    the height above base_level. The polygon is closed automatically.
+    """
+    field = u"walls[{}].profile".format(index)
+    if not isinstance(profile_raw, (list, tuple)) or len(profile_raw) < 3:
+        raise ValueError(u"{} needs at least 3 [along_mm, z_mm] points.".format(field))
+    origin = DB.XYZ(start.X, start.Y, base_level.Elevation)
+    direction = (DB.XYZ(end.X, end.Y, 0) - DB.XYZ(start.X, start.Y, 0)).Normalize()
+    points = []
+    for i, raw in enumerate(profile_raw):
+        if isinstance(raw, dict):
+            along, z = raw.get("along_mm"), raw.get("z_mm")
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            along, z = raw[0], raw[1]
+        else:
+            raise ValueError(u"{}[{}] must be [along_mm, z_mm].".format(field, i))
+        along_ft = _mm_to_ft(_to_float(along, u"{}[{}].along_mm".format(field, i), required=True))
+        z_ft = _mm_to_ft(_to_float(z, u"{}[{}].z_mm".format(field, i), required=True))
+        point = origin + direction * along_ft + DB.XYZ(0, 0, z_ft)
+        if points and point.DistanceTo(points[-1]) * MM_PER_FOOT < MIN_CURVE_LENGTH_MM:
+            continue
+        points.append(point)
+    if points[0].DistanceTo(points[-1]) * MM_PER_FOOT < MIN_CURVE_LENGTH_MM:
+        points.pop()
+    if len(points) < 3:
+        raise ValueError(u"{} collapses to fewer than 3 distinct points.".format(field))
+    zs = [p.Z for p in points]
+    summary = {
+        "index": index,
+        "type": _name(wall_type),
+        "level": _name(base_level),
+        "kind": "profile",
+        "vertex_count": len(points),
+        "bottom_mm": _ft_to_mm(min(zs) - base_level.Elevation),
+        "top_mm": _ft_to_mm(max(zs) - base_level.Elevation),
+    }
+    if is_dry_run:
+        return summary
+    curve_list = List[DB.Curve]()
+    for i, point in enumerate(points):
+        curve_list.Add(DB.Line.CreateBound(point, points[(i + 1) % len(points)]))
+    wall = DB.Wall.Create(doc, curve_list, wall_type.Id, base_level.Id, structural)
+    summary["element_id"] = get_element_id_text(wall.Id)
+    return summary
+
+
 def register_routes(api):
 
     # ----------------------------------------------------------- list types
@@ -1435,8 +1485,9 @@ def register_routes(api):
                 top_level_name = _merged(payload, item, "top_level_name")
                 top_level = _find_level(doc, top_level_name, "top_level_name") if top_level_name else None
                 height_mm = _to_float(_merged(payload, item, "height_mm"), "height_mm")
-                if top_level is None and height_mm is None:
-                    raise ValueError(u"Give either 'top_level_name' or 'height_mm'.")
+                profile_raw = item.get("profile")
+                if top_level is None and height_mm is None and not profile_raw:
+                    raise ValueError(u"Give either 'top_level_name', 'height_mm' or 'profile'.")
                 base_offset_mm = _to_float(_merged(payload, item, "base_offset_mm"), "base_offset_mm", 0.0)
                 top_offset_mm = _to_float(_merged(payload, item, "top_offset_mm"), "top_offset_mm", 0.0)
                 structural = _coerce_bool(_merged(payload, item, "structural"), default=True)
@@ -1446,6 +1497,10 @@ def register_routes(api):
                 end = _point_from(item.get("end"), u"walls[{}].end".format(index), base_level.Elevation)
                 if start.DistanceTo(end) * MM_PER_FOOT < MIN_CURVE_LENGTH_MM:
                     raise ValueError(u"walls[{}] start and end are the same point.".format(index))
+
+                if profile_raw:
+                    return _create_profile_wall(doc, index, item, profile_raw, start, end, base_level,
+                                                wall_type, structural, is_dry_run)
 
                 if top_level is not None:
                     unconnected_ft = max(top_level.Elevation - base_level.Elevation, 1.0 / MM_PER_FOOT)
@@ -2464,6 +2519,263 @@ def register_routes(api):
             return sanitize_for_json(result)
         except Exception as e:
             route_logger.error("Error in /modeling/place_groups_to_levels: {}".format(e), exc_info=True)
+            return _error(_text(e))
+
+    # ------------------------------------------------------ door / finish joins
+    def _join_summary(doc, element):
+        info = {"id": get_element_id_text(element.Id), "name": _name(element)}
+        try:
+            info["category"] = _text(element.Category.Name)
+        except Exception:
+            pass
+        try:
+            if element.GroupId != DB.ElementId.InvalidElementId:
+                info["group_id"] = get_element_id_text(element.GroupId)
+        except Exception:
+            pass
+        try:
+            vol = element.get_Parameter(DB.BuiltInParameter.HOST_VOLUME_COMPUTED)
+            if vol is not None:
+                info["volume_m3"] = round(vol.AsDouble() * 0.0283168466, 5)
+        except Exception:
+            pass
+        joined = []
+        try:
+            for jid in DB.JoinGeometryUtils.GetJoinedElements(doc, element):
+                other = doc.GetElement(jid)
+                if other is None:
+                    continue
+                entry = {"id": get_element_id_text(jid), "name": _name(other)}
+                try:
+                    entry["category"] = _text(other.Category.Name)
+                except Exception:
+                    pass
+                try:
+                    entry["this_cuts_other"] = bool(DB.JoinGeometryUtils.IsCuttingElementInJoin(doc, element, other))
+                except Exception:
+                    pass
+                joined.append(entry)
+        except Exception as join_error:
+            info["join_error"] = _text(join_error)
+        info["joined"] = joined
+        return info
+
+    @api.route('/modeling/door_finish_join_info', methods=['POST'])
+    def handle_door_finish_join_info(doc, request):
+        """Read-only: for each door, its host wall and the finish walls overlapping the door, with their geometry joins."""
+        route_logger = script.get_logger()
+        try:
+            _check_document(doc)
+            payload = request.data if hasattr(request, "data") else {}
+            if payload is None or not isinstance(payload, dict):
+                raise ValueError(u"Invalid JSON payload.")
+            raw_ids = payload.get("door_ids")
+            if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+                raise ValueError(u"door_ids must be a non-empty list.")
+            prefix = _text(payload.get("finish_name_prefix"))
+            pad_ft = _mm_to_ft(_to_float(payload.get("pad_mm"), "pad_mm", default=50.0))
+            doors = []
+            for raw in raw_ids:
+                door = doc.GetElement(make_element_id(DB, int(_text(raw))))
+                if door is None:
+                    continue
+                entry = {"door_id": get_element_id_text(door.Id), "door": _name(door)}
+                host = getattr(door, "Host", None)
+                if host is not None:
+                    entry["host"] = _join_summary(doc, host)
+                box = door.get_BoundingBox(None)
+                finishes = []
+                if box is not None:
+                    outline = DB.Outline(DB.XYZ(box.Min.X - pad_ft, box.Min.Y - pad_ft, box.Min.Z + pad_ft),
+                                         DB.XYZ(box.Max.X + pad_ft, box.Max.Y + pad_ft, box.Max.Z - pad_ft))
+                    near = (DB.FilteredElementCollector(doc).OfClass(DB.Wall)
+                            .WherePasses(DB.BoundingBoxIntersectsFilter(outline)).ToElements())
+                    for wall in near:
+                        if host is not None and get_element_id_value(wall.Id) == get_element_id_value(host.Id):
+                            continue
+                        type_name = _name(wall)
+                        if prefix and not type_name.startswith(prefix):
+                            continue
+                        finishes.append(_join_summary(doc, wall))
+                entry["finish_walls"] = finishes
+                doors.append(entry)
+            return sanitize_for_json({"status": "success", "doors": doors})
+        except Exception as e:
+            route_logger.error("Error in /modeling/door_finish_join_info: {}".format(e), exc_info=True)
+            return _error(_text(e))
+
+    @api.route('/modeling/join_pair', methods=['POST'])
+    def handle_join_pair(doc, request):
+        """Join two elements' geometry in one transaction; 'cutting_id' (optional) ends up cutting the other."""
+        route_logger = script.get_logger()
+        try:
+            _check_document(doc)
+            payload = request.data if hasattr(request, "data") else {}
+            if payload is None or not isinstance(payload, dict):
+                raise ValueError(u"Invalid JSON payload.")
+            dry_run = _coerce_bool(payload.get("dry_run"), default=False)
+            a = doc.GetElement(make_element_id(DB, int(_text(payload.get("first_id")))))
+            b = doc.GetElement(make_element_id(DB, int(_text(payload.get("second_id")))))
+            if a is None or b is None:
+                raise ValueError(u"first_id / second_id not found.")
+            cutting_raw = payload.get("cutting_id")
+            result = {"before": {"first": _join_summary(doc, a), "second": _join_summary(doc, b)},
+                      "already_joined": bool(DB.JoinGeometryUtils.AreElementsJoined(doc, a, b))}
+            if dry_run:
+                result["status"] = "dry_run"
+                return sanitize_for_json(result)
+            collector_w = _WarningCollector()
+            transaction = DB.Transaction(doc, "RevitMCP Join Pair")
+            options = transaction.GetFailureHandlingOptions()
+            options.SetFailuresPreprocessor(collector_w)
+            options.SetClearAfterRollback(True)
+            transaction.SetFailureHandlingOptions(options)
+            transaction.Start()
+            try:
+                if not DB.JoinGeometryUtils.AreElementsJoined(doc, a, b):
+                    DB.JoinGeometryUtils.JoinGeometry(doc, a, b)
+                if cutting_raw:
+                    cutter, other = (a, b) if _text(cutting_raw) == get_element_id_text(a.Id) else (b, a)
+                    if not DB.JoinGeometryUtils.IsCuttingElementInJoin(doc, cutter, other):
+                        DB.JoinGeometryUtils.SwitchJoinOrder(doc, cutter, other)
+                status = transaction.Commit()
+            except Exception:
+                if transaction.HasStarted() and not transaction.HasEnded():
+                    transaction.RollBack()
+                raise
+            committed = status == DB.TransactionStatus.Committed
+            result.update({
+                "status": "success" if committed else "error",
+                "transaction": _text(status),
+                "errors": collector_w.errors[:20],
+                "warnings": collector_w.warnings[:20],
+                "after": {"first": _join_summary(doc, a), "second": _join_summary(doc, b)},
+            })
+            return sanitize_for_json(result)
+        except Exception as e:
+            route_logger.error("Error in /modeling/join_pair: {}".format(e), exc_info=True)
+            return _error(_text(e))
+
+    @api.route('/modeling/ungroup_join_regroup', methods=['POST'])
+    def handle_ungroup_join_regroup(doc, request):
+        """Ungroup one group instance, join given (cutting, other) pairs one transaction each, then regroup the members."""
+        route_logger = script.get_logger()
+        try:
+            _check_document(doc)
+            payload = request.data if hasattr(request, "data") else {}
+            if payload is None or not isinstance(payload, dict):
+                raise ValueError(u"Invalid JSON payload.")
+            dry_run = _coerce_bool(payload.get("dry_run"), default=False)
+            group = doc.GetElement(make_element_id(DB, int(_text(payload.get("group_id")))))
+            if not isinstance(group, DB.Group):
+                raise ValueError(u"group_id is not a group instance.")
+            raw_pairs = payload.get("pairs") or []
+            pairs = []
+            for p in raw_pairs:
+                cutter = doc.GetElement(make_element_id(DB, int(_text(p[0]))))
+                other = doc.GetElement(make_element_id(DB, int(_text(p[1]))))
+                if cutter is None or other is None:
+                    raise ValueError(u"Pair element not found: {}".format(p))
+                pairs.append((cutter, other))
+            new_type_name = _text(payload.get("new_type_name"))
+            member_ids = [get_element_id_text(i) for i in group.GetMemberIds()]
+            result = {"group_id": get_element_id_text(group.Id), "group_type": _name(group.GroupType),
+                      "members": member_ids, "pair_count": len(pairs)}
+            if dry_run:
+                result["status"] = "dry_run"
+                result["before"] = [_join_summary(doc, doc.GetElement(make_element_id(DB, int(i)))) for i in member_ids]
+                return sanitize_for_json(result)
+
+            collector_w = _WarningCollector()
+
+            def run(name, action):
+                collector_w.errors = []
+                transaction = DB.Transaction(doc, name)
+                options = transaction.GetFailureHandlingOptions()
+                options.SetFailuresPreprocessor(collector_w)
+                options.SetClearAfterRollback(True)
+                transaction.SetFailureHandlingOptions(options)
+                transaction.Start()
+                try:
+                    value = action()
+                    status = transaction.Commit()
+                except Exception:
+                    if transaction.HasStarted() and not transaction.HasEnded():
+                        transaction.RollBack()
+                    raise
+                if status != DB.TransactionStatus.Committed:
+                    raise ValueError(u"rolled back: {}".format(u" | ".join(collector_w.errors[:4])))
+                return value
+
+            # 1) ungroup
+            try:
+                freed = run("RevitMCP Ungroup", lambda: [get_element_id_text(i) for i in group.UngroupMembers()])
+            except Exception as ungroup_error:
+                result.update({"status": "error", "message": u"Ungroup failed: {}".format(_text(ungroup_error))})
+                return sanitize_for_json(result)
+            result["ungrouped_members"] = freed
+
+            # 2) joins, one transaction per pair
+            joins = []
+            for cutter, other in pairs:
+                entry = {"cutting": get_element_id_text(cutter.Id), "other": get_element_id_text(other.Id)}
+
+                def do_join(c=cutter, o=other):
+                    if not DB.JoinGeometryUtils.AreElementsJoined(doc, c, o):
+                        DB.JoinGeometryUtils.JoinGeometry(doc, c, o)
+                    if not DB.JoinGeometryUtils.IsCuttingElementInJoin(doc, c, o):
+                        DB.JoinGeometryUtils.SwitchJoinOrder(doc, c, o)
+                try:
+                    run("RevitMCP Join Pair", do_join)
+                    entry["status"] = "joined"
+                except Exception as join_error:
+                    entry["status"] = "failed"
+                    entry["error"] = _text(join_error)
+                joins.append(entry)
+            result["joins"] = joins
+            result["after_join"] = [_join_summary(doc, doc.GetElement(make_element_id(DB, int(i)))) for i in freed]
+
+            # 3) regroup
+            def do_group():
+                ids = List[DB.ElementId]()
+                for i in freed:
+                    ids.Add(make_element_id(DB, int(i)))
+                new_group = doc.Create.NewGroup(ids)
+                renamed = None
+                if new_type_name:
+                    names = set(_name(t) for t in DB.FilteredElementCollector(doc).OfClass(DB.GroupType))
+                    final = new_type_name
+                    k = 2
+                    while final in names:
+                        final = u"{}_{}".format(new_type_name, k)
+                        k += 1
+                    try:
+                        new_group.GroupType.Name = final
+                        renamed = final
+                    except Exception:
+                        param = new_group.GroupType.get_Parameter(DB.BuiltInParameter.SYMBOL_NAME_PARAM)
+                        if param is not None and not param.IsReadOnly:
+                            param.Set(final)
+                            renamed = final
+                return new_group, renamed
+            try:
+                new_group, renamed = run("RevitMCP Regroup", do_group)
+                result["new_group"] = get_element_id_text(new_group.Id)
+                result["new_group_type"] = _name(new_group.GroupType)
+                result["renamed_to"] = renamed
+                result["new_group_members"] = [get_element_id_text(i) for i in new_group.GetMemberIds()]
+            except Exception as group_error:
+                result["regroup_error"] = _text(group_error)
+            result["after_regroup"] = [_join_summary(doc, doc.GetElement(make_element_id(DB, int(i)))) for i in freed]
+            result.update({
+                "status": "success" if "regroup_error" not in result else "partial_success",
+                "warnings": collector_w.warnings[:50],
+                "auto_unjoined": collector_w.auto_unjoined[:50],
+                "undo_hint": u"Separate transactions: ungroup, one per join, regroup.",
+            })
+            return sanitize_for_json(result)
+        except Exception as e:
+            route_logger.error("Error in /modeling/ungroup_join_regroup: {}".format(e), exc_info=True)
             return _error(_text(e))
 
     # ------------------------------------------------------------- ceilings

@@ -520,7 +520,10 @@ def build_modeling_tools() -> list[ToolDefinition]:
                 "trim_at_columns=true stops the walls at existing column faces; trim_top_to_structure=true stops the "
                 "wall top at the underside of beams/floors above (level line where there are none). "
                 "Give top_level_name (top constrained, plus top_offset_mm) or height_mm (unconnected height). "
-                "Call-level settings can be overridden per item. One transaction per call; supports dry_run."
+                "Call-level settings can be overridden per item. One transaction per call; supports dry_run. "
+                "For a non-rectangular elevation (e.g. a finish wall whose top follows a stair run), give an "
+                "item 'profile': [[along_mm, z_mm], ...] measured from start toward end, z above level_name; "
+                "start/end then only set the wall line and height/top settings are ignored for that item."
             ),
             json_schema={
                 "type": "object",
@@ -533,7 +536,15 @@ def build_modeling_tools() -> list[ToolDefinition]:
                         ),
                         "items": {
                             "type": "object",
-                            "properties": {"start": _POINT_SCHEMA, "end": _POINT_SCHEMA},
+                            "properties": {
+                                "start": _POINT_SCHEMA,
+                                "end": _POINT_SCHEMA,
+                                "profile": {
+                                    "type": "array",
+                                    "description": "Closed elevation outline [[along_mm, z_mm], ...]; z above the base level.",
+                                    "items": {"type": "array", "items": {"type": "number"}},
+                                },
+                            },
                             "required": ["start", "end"],
                         },
                     },
