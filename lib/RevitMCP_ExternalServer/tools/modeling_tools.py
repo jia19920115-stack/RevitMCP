@@ -369,6 +369,10 @@ def copy_walls_to_levels_handler(
     })
 
 
+def get_element_shapes_handler(services, element_ids: list = None, **_kwargs) -> dict:
+    return _call(services, "get_element_shapes", "/modeling/element_shapes", {"element_ids": element_ids})
+
+
 def create_ceilings_handler(
     services,
     ceilings: list = None,
@@ -794,6 +798,21 @@ def build_modeling_tools() -> list[ToolDefinition]:
                 "required": ["element_ids", "from_level_name", "to_level_names"],
             },
             handler=copy_walls_to_levels_handler,
+        ),
+        ToolDefinition(
+            name="get_element_shapes",
+            description=(
+                "Read-only. For walls: base/top level and offsets, start/end (mm) and, for edited-profile walls, "
+                "profile_loops as [[along_mm, z_mm], ...] (along from start toward end, z above the base level) - the "
+                "same form create_walls 'profile' takes. For floors: level, offset_mm, sketch boundary_loops "
+                "[[x_mm, y_mm]...] and slab_vertices (x_mm, y_mm, offset_mm from the floor top) when shape-edited."
+            ),
+            json_schema={
+                "type": "object",
+                "properties": {"element_ids": {"type": "array", "items": {"type": "string"}}},
+                "required": ["element_ids"],
+            },
+            handler=get_element_shapes_handler,
         ),
         ToolDefinition(
             name="create_ceilings",

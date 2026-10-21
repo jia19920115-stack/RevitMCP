@@ -2480,6 +2480,122 @@ def register_routes(api):
             route_logger.error("Error in /modeling/copy_walls_to_levels: {}".format(e), exc_info=True)
             return _error(_text(e))
 
+    # ------------------------------------------------------- read shapes
+    @api.route('/modeling/element_shapes', methods=['POST'])
+    def handle_element_shapes(doc, request):
+        """Read-only: wall location line + edited elevation profile, floor sketch boundary + slab-shape vertices,
+        in the units create_walls (profile [[along_mm, z_mm]]) and create_floors / edit_floor_shape take."""
+        route_logger = script.get_logger()
+        try:
+            _check_document(doc)
+            payload = request.data if hasattr(request, "data") else {}
+            if payload is None or not isinstance(payload, dict):
+                raise ValueError(u"Invalid JSON payload.")
+            raw_ids = payload.get("element_ids")
+            if not isinstance(raw_ids, (list, tuple)) or not raw_ids:
+                raise ValueError(u"element_ids must be a non-empty list.")
+
+            def pt(p):
+                return [_ft_to_mm(p.X), _ft_to_mm(p.Y), _ft_to_mm(p.Z)]
+
+            def curve_points(curve):
+                try:
+                    return list(curve.Tessellate()) if not isinstance(curve, DB.Line) else \
+                        [curve.GetEndPoint(0), curve.GetEndPoint(1)]
+                except Exception:
+                    return [curve.GetEndPoint(0), curve.GetEndPoint(1)]
+
+            def loops_of(profile):
+                loops = []
+                for curve_array in profile:
+                    loop = []
+                    for curve in curve_array:
+                        loop.append(curve_points(curve)[:-1] or [curve.GetEndPoint(0)])
+                    loops.append([p for seg in loop for p in seg])
+                return loops
+
+            out = []
+            for raw in raw_ids:
+                entry = {"element_id": _text(raw)}
+                element = doc.GetElement(make_element_id(DB, int(_text(raw))))
+                if element is None:
+                    entry["error"] = u"not found"
+                    out.append(entry)
+                    continue
+                entry["type"] = _name(element)
+                try:
+                    level = doc.GetElement(element.LevelId)
+                    entry["level"] = _name(level)
+                    level_z = level.Elevation
+                except Exception:
+                    level, level_z = None, 0.0
+                box = element.get_BoundingBox(None)
+                if box is not None:
+                    entry["bbox_min"] = pt(box.Min)
+                    entry["bbox_max"] = pt(box.Max)
+                sketch = None
+                try:
+                    if element.SketchId != DB.ElementId.InvalidElementId:
+                        sketch = doc.GetElement(element.SketchId)
+                except Exception:
+                    sketch = None
+                if isinstance(element, DB.Wall):
+                    entry["kind"] = "wall"
+                    try:
+                        base = doc.GetElement(element.get_Parameter(DB.BuiltInParameter.WALL_BASE_CONSTRAINT).AsElementId())
+                        entry["base_level"] = _name(base)
+                        level_z = base.Elevation
+                        entry["base_offset_mm"] = _ft_to_mm(element.get_Parameter(DB.BuiltInParameter.WALL_BASE_OFFSET).AsDouble())
+                        top_id = element.get_Parameter(DB.BuiltInParameter.WALL_HEIGHT_TYPE).AsElementId()
+                        if top_id != DB.ElementId.InvalidElementId:
+                            entry["top_level"] = _name(doc.GetElement(top_id))
+                            entry["top_offset_mm"] = _ft_to_mm(element.get_Parameter(DB.BuiltInParameter.WALL_TOP_OFFSET).AsDouble())
+                        entry["unconnected_height_mm"] = _ft_to_mm(element.get_Parameter(DB.BuiltInParameter.WALL_USER_HEIGHT_PARAM).AsDouble())
+                    except Exception:
+                        pass
+                    try:
+                        entry["structural"] = bool(element.get_Parameter(DB.BuiltInParameter.WALL_STRUCTURAL_SIGNIFICANT).AsInteger())
+                    except Exception:
+                        pass
+                    try:
+                        entry["flipped"] = bool(element.Flipped)
+                        entry["location_line"] = element.get_Parameter(DB.BuiltInParameter.WALL_KEY_REF_PARAM).AsInteger()
+                    except Exception:
+                        pass
+                    curve = element.Location.Curve
+                    p0, p1 = curve.GetEndPoint(0), curve.GetEndPoint(1)
+                    entry["start_mm"] = [_ft_to_mm(p0.X), _ft_to_mm(p0.Y)]
+                    entry["end_mm"] = [_ft_to_mm(p1.X), _ft_to_mm(p1.Y)]
+                    if sketch is not None:
+                        direction = (DB.XYZ(p1.X, p1.Y, 0) - DB.XYZ(p0.X, p0.Y, 0)).Normalize()
+                        origin = DB.XYZ(p0.X, p0.Y, 0)
+                        loops = []
+                        for loop in loops_of(sketch.Profile):
+                            loops.append([[_ft_to_mm((DB.XYZ(p.X, p.Y, 0) - origin).DotProduct(direction)),
+                                           _ft_to_mm(p.Z - level_z)] for p in loop])
+                        entry["profile_loops"] = loops
+                elif isinstance(element, DB.Floor):
+                    entry["kind"] = "floor"
+                    try:
+                        entry["offset_mm"] = _ft_to_mm(element.get_Parameter(DB.BuiltInParameter.FLOOR_HEIGHTABOVELEVEL_PARAM).AsDouble())
+                    except Exception:
+                        pass
+                    if sketch is not None:
+                        entry["boundary_loops"] = [[[_ft_to_mm(p.X), _ft_to_mm(p.Y)] for p in loop]
+                                                   for loop in loops_of(sketch.Profile)]
+                    try:
+                        editor = _slab_editor(element)
+                        if editor is not None and editor.IsEnabled:
+                            entry["slab_vertices"] = _vertex_list(editor, _floor_top_z(element))
+                            entry["slab_vertices_abs"] = [pt(v.Position) for v in _editor_vertices(editor)]
+                    except Exception as shape_error:
+                        entry["slab_error"] = _text(shape_error)
+                out.append(entry)
+            return sanitize_for_json({"status": "success", "count": len(out), "elements": out})
+        except Exception as e:
+            route_logger.error("Error in /modeling/element_shapes: {}".format(e), exc_info=True)
+            return _error(_text(e))
+
     # ------------------------------------------------------- place groups
     @api.route('/modeling/place_groups_to_levels', methods=['POST'])
     def handle_place_groups_to_levels(doc, request):
