@@ -45,7 +45,25 @@ if not forms.alert(
 
 done = []
 failed = []
+skipped_log = []
 used_names = set()
+
+
+def _probe_ok(el):
+    """True if this single element can be put into an assembly (trial create, rolled back)."""
+    st = DB.SubTransaction(doc)
+    st.Start()
+    try:
+        one = List[DB.ElementId]()
+        one.Add(el.Id)
+        DB.AssemblyInstance.Create(doc, one, el.Category.Id)
+        return True
+    except Exception:
+        return False
+    finally:
+        st.RollBack()
+
+
 for g in targets:
     name = g.Name
     gid = g.Id.IntegerValue if hasattr(g.Id, "IntegerValue") else g.Id.Value
@@ -56,40 +74,56 @@ for g in targets:
         doc.Regenerate()
         ids = List[DB.ElementId]()
         first = None
+        skipped = []
         for mid in members:
             el = doc.GetElement(mid)
-            if el is None or el.Category is None:
+            if el is None or el.Category is None or not _probe_ok(el):
+                skipped.append(u"{} {}".format(mid.IntegerValue if hasattr(mid, "IntegerValue") else mid.Value,
+                                               el.Category.Name if (el is not None and el.Category is not None) else u"?"))
                 continue
             ids.Add(mid)
             if first is None:
                 first = el
         if first is None:
-            raise Exception("no members")
+            raise Exception("no valid members")
         asm = DB.AssemblyInstance.Create(doc, ids, first.Category.Id)
-        doc.Regenerate()
-        final = name
-        if final in used_names:
-            final = u"{}_{}".format(name, gid)
-        asm.AssemblyTypeName = final
-        used_names.add(final)
+        asm_id = asm.Id
         t.Commit()
-        done.append((final, ids.Count))
     except Exception as ex:
         t.RollBack()
-        detail = traceback.format_exc()
-        failed.append((name, u"{} | {}".format(ex, detail)))
+        failed.append((name, u"{} | {}".format(ex, traceback.format_exc())))
+        continue
+    final = name
+    if final in used_names:
+        final = u"{}_{}".format(name, gid)
+    t2 = DB.Transaction(doc, u"Rename assembly: {}".format(name))
+    t2.Start()
+    try:
+        doc.GetElement(asm_id).AssemblyTypeName = final
+        t2.Commit()
+        used_names.add(final)
+    except Exception as ex:
+        t2.RollBack()
+        skipped.append(u"RENAME FAILED ({}); assembly keeps default name".format(ex))
+    done.append((final, ids.Count))
+    if skipped:
+        skipped_log.append((final, skipped))
 
 output.print_md(u"## Done: {}  Failed: {}".format(len(done), len(failed)))
 for n, c in done:
     output.print_md(u"- {} ({} elements)".format(n, c))
 for n, e in failed:
     output.print_md(u"- **FAILED** {}: {}".format(n, e))
+for n, sk in skipped_log:
+    output.print_md(u"- {} skipped {}: {}".format(n, len(sk), u"; ".join(sk[:20])))
 log_path = os.path.join(os.path.expanduser("~"), "Desktop", "Groups_to_Assemblies_log.txt")
 try:
     with io.open(log_path, "w", encoding="utf-8") as fh:
         fh.write(u"done={} failed={}\n".format(len(done), len(failed)))
         for n, c in done:
             fh.write(u"OK {} ({})\n".format(n, c))
+        for n, sk in skipped_log:
+            fh.write(u"SKIPPED {} ({}): {}\n".format(n, len(sk), u"; ".join(sk)))
         for n, e in failed:
             fh.write(u"FAILED {}: {}\n".format(n, e))
 except Exception:
