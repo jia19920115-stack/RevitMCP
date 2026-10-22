@@ -6,6 +6,9 @@ so an IFC export carries IfcElementAssembly (BIMvision 'Select group' picks the 
 
 __title__ = u"Groups to\nAssemblies"
 
+import io
+import os
+import traceback
 from pyrevit import revit, DB, forms, script
 from System.Collections.Generic import List
 
@@ -50,6 +53,7 @@ for g in targets:
     t.Start()
     try:
         members = list(g.UngroupMembers())
+        doc.Regenerate()
         ids = List[DB.ElementId]()
         first = None
         for mid in members:
@@ -72,12 +76,25 @@ for g in targets:
         done.append((final, ids.Count))
     except Exception as ex:
         t.RollBack()
-        failed.append((name, str(ex)))
+        detail = traceback.format_exc()
+        failed.append((name, u"{} | {}".format(ex, detail)))
 
 output.print_md(u"## Done: {}  Failed: {}".format(len(done), len(failed)))
 for n, c in done:
     output.print_md(u"- {} ({} elements)".format(n, c))
 for n, e in failed:
     output.print_md(u"- **FAILED** {}: {}".format(n, e))
+log_path = os.path.join(os.path.expanduser("~"), "Desktop", "Groups_to_Assemblies_log.txt")
+try:
+    with io.open(log_path, "w", encoding="utf-8") as fh:
+        fh.write(u"done={} failed={}\n".format(len(done), len(failed)))
+        for n, c in done:
+            fh.write(u"OK {} ({})\n".format(n, c))
+        for n, e in failed:
+            fh.write(u"FAILED {}: {}\n".format(n, e))
+except Exception:
+    pass
+
 forms.alert(u"Assemblies created: {}\nFailed (rolled back): {}\nSee pyRevit output window for details.".format(len(done), len(failed)),
             title=u"Groups to Assemblies")
+
